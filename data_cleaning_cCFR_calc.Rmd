@@ -1,0 +1,3535 @@
+---
+title: "Corrected CFR calculations for COVID-19 data"
+author: "Jess A. Millar"
+header-includes:
+   - \usepackage{amsmath}
+output:
+  html_document:
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+    number_sections: FALSE
+params:
+  prefix: comp
+csl: ecology.csl
+---
+
+```{r options,include=FALSE,purl=FALSE,warning=FALSE, echo=FALSE}
+library(knitr)
+opts_chunk$set(
+  progress=TRUE,
+  prompt=FALSE,tidy=FALSE,highlight=TRUE,
+  strip.white=TRUE,
+  message=FALSE,
+  warning=TRUE,
+  error=TRUE,
+  echo=TRUE,
+  cache=FALSE,
+  cache.extra=rand_seed,
+  fig.path=paste0("figure/",params$prefix,"-"),
+  cache.path=paste0("cache/",params$prefix,"-"),
+  results='markup',
+  fig.show='asis',
+  size='small',
+  fig.align='center',
+  fig.height=4,fig.width=6.83,
+  dpi=100,
+  dev='png',
+  dev.args=list(bg='transparent')
+)
+options(
+  keep.source=TRUE,
+  encoding="UTF-8",
+  stringsAsFactors=FALSE
+)
+set.seed(728073764L)
+```
+
+```{r packages,warning=FALSE, echo=FALSE}
+## install.packages("aakmisc",repos="https://kingaa.github.io/")
+library(tidyverse)
+library(lubridate)
+library(usmap)
+library(padr)
+#library(kableExtra)
+```
+
+-----------
+
+# Output variable
+## Load and select data
+
+We interested in the corrected Case Fatality Rates for COVID-19 for the United States at the county level. We use the NYT COVID-19 data set ( [github here](https://github.com/nytimes/covid-19-data) ), which includes date, county, state, FIPS id number, cumulative confirmed cases, and cumulative confirmed deaths.
+
+```{r load_data}
+setwd("~/Downloads/covid19")
+read_delim("data/NYT-Cases-US-Counties2.csv", delim=",",
+           col_names=TRUE,
+           col_types = "Dcciii") -> dat
+
+max(dat$date)->max_date
+
+dat
+```
+
+Several FIPS ids are missing, including two large, multi county cities: Kansas City, MO and New York City, NY. For counties with FIPS, there is only one per county.
+
+```{r missing_fips}
+dat %>%
+  dplyr::select(state,county,fips) %>%
+  filter(is.na(fips)) %>%
+  unique() %>%
+  arrange(county)
+
+# Only 1 fips per county, state
+stopifnot(
+  dat %>%
+    dplyr::select(state,county,fips) %>%
+    unique() %>%
+    group_by(state,county) %>%
+    summarise(fips_n=n()) %>%
+    filter(fips_n>1) %>% nrow()==0
+)
+```
+
+Kansas City, MO overlaps four counties: Jackson, Clay, Cass, and Platte. The parts of the counties that are not considered Kansas City report their data separately. Data for individual counties within Kansas City, MO are not reported. We will drop the Kansas City total from the data set as we are unable to separate them into counties and the data we have for the counties follows a similar pattern.
+
+```{r kc_mo}
+dat %>%
+  filter(state=="Missouri") %>%
+  filter(county %in% c("Jackson","Clay","Cass","Platte","Kansas City")) %>%
+  dplyr::select(-state,-fips,-deaths) %>%
+  spread(county,cases) %>%
+  replace(., is.na(.), 0) %>%
+  mutate("Kansas City counties" = Cass+Clay+Platte+Jackson) %>%
+  dplyr::select(date,"Kansas City counties", "Kansas City") %>%
+  gather("location","cases",-date) %>%
+  ggplot(aes(x=date, y=cases, group=location)) +
+  geom_line(aes(linetype=location)) +
+  ylab("Number of Cases") + xlab("Date")
+
+dat %>%
+  filter(!(state=="Missouri" & county=="Kansas City"))->dat2
+```
+
+New York City, NY is made of five counties: Bronx, Kings (Brooklyn), New York (Manhattan), Queens, and Richmond (Staten Island). These counties are not included in the data set and will have to be imported from elsewhere. We compiled NYC data from [nyc.gov](https://www1.nyc.gov/site/doh/covid/covid-19-data-boroughs.page).
+
+This data set lists new cases and deaths, as compared to cumulative. We will combine this data with the rest once we've converted the other data to new cases and deaths.
+
+```{r nyc_ny, warning=FALSE}
+# Bronx
+read_delim("data/bronx-GHyLp.csv", delim=",",
+           col_names=TRUE,
+           col_types = "?iii") %>%
+  mutate(DATE_OF_INTEREST = as.Date(DATE_OF_INTEREST, "%m/%d/%Y"),
+         fips = 36005) %>%
+  dplyr::select(date=DATE_OF_INTEREST,fips,new_cases=Cases,new_deaths=Deaths) -> dat_nyc_bronx
+
+# Brooklyn
+read_delim("data/brooklyn-Q7Zjo.csv", delim=",",
+           col_names=TRUE,
+           col_types = "?iii") %>%
+  mutate(DATE_OF_INTEREST = as.Date(DATE_OF_INTEREST, "%m/%d/%Y"),
+         fips = 36047) %>%
+  dplyr::select(date=DATE_OF_INTEREST,fips,new_cases=Cases,new_deaths=Deaths) -> dat_nyc_brooklyn
+
+# Manhattan
+read_delim("data/manhattan-rqvAu.csv", delim=",",
+           col_names=TRUE,
+           col_types = "?iii") %>%
+  mutate(DATE_OF_INTEREST = as.Date(DATE_OF_INTEREST, "%m/%d/%Y"),
+         fips = 36061) %>%
+  dplyr::select(date=DATE_OF_INTEREST,fips,new_cases=Cases,new_deaths=Deaths) -> dat_nyc_manhattan
+
+# Queens
+read_delim("data/queens-HXuvT.csv", delim=",",
+           col_names=TRUE,
+           col_types = "?iii") %>%
+  mutate(DATE_OF_INTEREST = as.Date(DATE_OF_INTEREST, "%m/%d/%Y"),
+         fips = 36081) %>%
+  dplyr::select(date=DATE_OF_INTEREST,fips,new_cases=Cases,new_deaths=Deaths) -> dat_nyc_queens
+
+# Staten Island
+read_delim("data/si-u1Bfw.csv", delim=",",
+           col_names=TRUE,
+           col_types = "?iii") %>%
+  mutate(DATE_OF_INTEREST = as.Date(DATE_OF_INTEREST, "%m/%d/%Y"),
+         fips = 36085) %>%
+  dplyr::select(date=DATE_OF_INTEREST,fips,new_cases=Cases,new_deaths=Deaths) -> dat_nyc_si
+
+rbind(dat_nyc_bronx, dat_nyc_brooklyn, dat_nyc_manhattan, dat_nyc_queens, dat_nyc_si) %>%
+  arrange(fips,date) %>%
+  group_by(fips) %>%
+  mutate(keep = cumsum(new_cases)) %>%
+  filter(keep != 0) %>%
+  dplyr::select(-keep) %>%
+  ungroup() -> dat_nyc
+
+dat_nyc
+```
+
+We will remove "unknown" counties, as those cannot be linked to fips data.
+
+```{r unknown_counties}
+dat2 %>%
+  filter(county=="Unknown") %>%
+  group_by(state) %>%
+  arrange(date) %>%
+  slice(n()) %>%
+  arrange(desc(cases))
+
+dat2 %>%
+  filter(county != "Unknown") %>%
+  filter(county != "New York City") %>%
+  filter(cases>0)-> dat3
+```
+
+There are 89 instances where deaths are reset to 0 after deaths had been mis-reported. The dates before this will have deaths reset to 0.
+
+```{r reset_0_deaths}
+dat3 %>%
+  group_by(fips) %>%
+  mutate(reset_deaths = ifelse(deaths == 0 & lag(deaths)>0, 1, 0),
+         reset_deaths = coalesce(reset_deaths,0)) %>%
+  ungroup() %>%
+  filter(reset_deaths==1) %>% nrow()
+
+dat3 %>%
+  group_by(fips) %>%
+  mutate(reset_deaths = ifelse(deaths == 0 & lag(deaths)>0, 1, 0),
+         reset_deaths = coalesce(reset_deaths,0),
+         reset_deaths = cumsum(reset_deaths),
+         deaths = ifelse(reset_deaths == max(reset_deaths), deaths, 0)) %>%
+  ungroup() %>%
+  dplyr::select(-reset_deaths) -> dat4
+```
+
+We have 601 data points that have negative new deaths (death toll revised to be less than previous day). All but 34 of these can be fixed by removing the discrepancy from the previous days new deaths. The last 34 have very few data points, but need multiple days reset.
+
+```{r death_data,warning=FALSE}
+dat4 %>%
+  dplyr::select(date, fips, deaths) %>%
+  group_by(fips) %>%
+  mutate(keep = ifelse(deaths == lag(deaths),0,1),
+         keep = coalesce(keep,1)) %>%
+  filter(keep==1) %>%
+  mutate(new_deaths = deaths - lag(deaths),
+         new_deaths = coalesce(new_deaths,deaths),
+         new_deaths2 = ifelse(new_deaths<0 & abs(new_deaths) <= lag(new_deaths), 1,0),
+         deaths2 = ifelse(lead(new_deaths2)==1,deaths+lead(new_deaths),deaths),
+         deaths2 = coalesce(deaths2,deaths)) %>%
+  ungroup() -> deaths
+
+deaths %>%
+  filter(new_deaths<0) %>% nrow()
+
+deaths %>%
+  dplyr::select(date, fips, deaths=deaths2) %>%
+  group_by(fips) %>%
+  mutate(keep = ifelse(deaths == lag(deaths),0,1),
+         keep = coalesce(keep,1)) %>%
+  filter(keep==1) %>%
+  mutate(new_deaths = deaths - lag(deaths),
+         new_deaths = coalesce(new_deaths,deaths),
+         new_deaths2 = ifelse(new_deaths<0 & abs(new_deaths) <= lag(new_deaths), 1,0),
+         deaths2 = ifelse(lead(new_deaths2)==1,deaths+lead(new_deaths),deaths),
+         deaths2 = coalesce(deaths2,deaths)) %>%
+  ungroup() -> deaths
+
+deaths %>%
+  filter(new_deaths<0,new_deaths2==0) %>% nrow()
+deaths %>% filter(new_deaths<0,new_deaths2==0) %>% pull(fips)-> fips_prob
+
+deaths %>%
+  filter(fips %in% fips_prob) %>%
+  group_by(fips) %>%
+  mutate(deaths = deaths2,
+         new_deaths = deaths - lag(deaths),
+         new_deaths = coalesce(new_deaths,deaths),
+         new_deaths2 = ifelse(new_deaths<0 & abs(new_deaths) <= lag(new_deaths), 1,0)) %>%
+  mutate(keep_value = ifelse(new_deaths<0,deaths,NA),
+         keep_value = ifelse(is.finite(keep_value) & is.finite(lead(keep_value)), NA,keep_value),
+         keep = ifelse(is.finite(keep_value),1,0),
+         #keep = cumsum(keep),
+         #keep_value = max(keep_value, na.rm=TRUE),
+         ) %>%
+  fill(keep_value,.direction="up") %>%
+  mutate(deaths2 = ifelse(is.finite(keep_value) & keep_value < deaths, keep_value, deaths)) %>%
+  ungroup() %>%
+  dplyr::select(date, fips, deaths=deaths2) -> deaths_fips_prob
+
+deaths %>%
+  filter(!(fips %in% fips_prob)) %>%
+  dplyr::select(date,fips,deaths=deaths2) %>%
+  rbind(deaths_fips_prob) -> deaths_clean
+```
+
+We have 3789 data points that have negative incidence. All but 308 of these can be fixed by removing the discrepancy from the previous days incidence. The last 308 have very few data points, but need multiple days reset.
+
+```{r cases_data,warning=FALSE}
+dat4 %>%
+  dplyr::select(date, fips, cases) %>%
+  group_by(fips) %>%
+  mutate(keep = ifelse(cases == lag(cases),0,1),
+         keep = coalesce(keep,1)) %>%
+  filter(keep==1) %>%
+  mutate(new_cases = cases - lag(cases),
+         new_cases = coalesce(new_cases,cases),
+         new_cases2 = ifelse(new_cases<0 & abs(new_cases) <= lag(new_cases), 1,0),
+         cases2 = ifelse(lead(new_cases2)==1,cases+lead(new_cases),cases),
+         cases2 = coalesce(cases2,cases)) %>%
+  ungroup() -> cases
+
+cases %>%
+  filter(new_cases<0) %>% nrow()
+
+cases %>%
+  dplyr::select(date, fips, cases=cases2) %>%
+  group_by(fips) %>%
+  mutate(keep = ifelse(cases == lag(cases),0,1),
+         keep = coalesce(keep,1)) %>%
+  filter(keep==1) %>%
+  mutate(new_cases = cases - lag(cases),
+         new_cases = coalesce(new_cases,cases),
+         new_cases2 = ifelse(new_cases<0 & abs(new_cases) <= lag(new_cases), 1,0),
+         cases2 = ifelse(lead(new_cases2)==1,cases+lead(new_cases),cases),
+         cases2 = coalesce(cases2,cases)) %>%
+  ungroup() -> cases
+
+cases %>%
+  filter(new_cases<0,new_cases2==0) %>% nrow()
+cases %>% filter(new_cases<0,new_cases2==0) %>% pull(fips)-> fips_prob
+
+cases %>%
+  filter(fips %in% fips_prob) %>%
+  group_by(fips) %>%
+  mutate(cases = cases2,
+         new_cases = cases - lag(cases),
+         new_cases = coalesce(new_cases,cases),
+         new_cases2 = ifelse(new_cases<0 & abs(new_cases) <= lag(new_cases), 1,0)) %>%
+  mutate(keep_value = ifelse(new_cases<0,cases,NA),
+         keep_value = ifelse(is.finite(keep_value) & is.finite(lead(keep_value)), NA,keep_value),
+         keep = ifelse(is.finite(keep_value),1,0),
+         #keep = cumsum(keep),
+         #keep_value = max(keep_value, na.rm=TRUE),
+         ) %>%
+  fill(keep_value,.direction="up") %>%
+  mutate(cases2 = ifelse(is.finite(keep_value) & keep_value < cases, keep_value, cases)) %>%
+  ungroup() %>%
+  dplyr::select(date, fips, cases=cases2) -> cases_fips_prob
+
+cases %>%
+  filter(!(fips %in% fips_prob)) %>%
+  dplyr::select(date,fips,cases=cases2) %>%
+  rbind(cases_fips_prob) -> cases
+
+cases %>%
+  dplyr::select(date, fips, cases) %>%
+  group_by(fips) %>%
+  mutate(keep = ifelse(cases == lag(cases),0,1),
+         keep = coalesce(keep,1)) %>%
+  filter(keep==1) %>%
+  mutate(new_cases = cases - lag(cases),
+         new_cases = coalesce(new_cases,cases),
+         new_cases2 = ifelse(new_cases<0 & abs(new_cases) <= lag(new_cases), 1,0),
+         cases2 = ifelse(lead(new_cases2)==1,cases+lead(new_cases),cases),
+         cases2 = coalesce(cases2,cases)) %>%
+  mutate(keep = cases2 - lag(cases2,1)) %>%
+  filter(!is.finite(keep) | keep>=0) %>%
+  ungroup() %>%
+  dplyr::select(date,fips,cases=cases2) -> cases_clean
+```
+
+Dataset has gaps, but no more than one contiguous gap per county for both cases and deaths. Cleaned cases and deaths are combined with the full sequence of dates and fips. 3004 counties are currently represented.
+
+```{r gaps,warning=FALSE}
+stopifnot(
+  dat4 %>%
+    dplyr::select(date, fips, cases, deaths) %>%
+    group_by(fips) %>%
+    padr::pad() %>%
+    arrange(date) %>%
+    mutate(cases2 = ifelse(!is.na(cases) & lead(is.na(cases)),1,0)) %>%
+    filter(cases2>1) %>%
+    summarise(count=n()) %>% nrow()==0
+)
+
+stopifnot(
+  dat4 %>%
+    dplyr::select(date, fips, cases, deaths) %>%
+    group_by(fips) %>%
+    padr::pad() %>%
+    arrange(date) %>%
+    mutate(deaths2 = ifelse(!is.na(deaths) & lead(is.na(deaths)),1,0)) %>%
+    filter(deaths2>1) %>%
+    summarise(count=n()) %>% nrow()==0
+)
+
+dat4 %>%
+  dplyr::select(date, fips, cases, deaths) %>%
+  group_by(fips) %>%
+  padr::pad() %>%
+  arrange(date) %>%
+  dplyr::select(-cases,-deaths) %>%
+  ungroup() %>%
+  full_join(cases_clean) %>%
+  full_join(deaths_clean) %>%
+  arrange(fips,date) %>%
+  group_by(fips) %>%
+  fill(cases) %>%
+  fill(deaths) %>%
+  mutate(new_cases = cases - lag(cases),
+         new_cases = coalesce(new_cases,cases),
+         new_deaths = deaths - lag(deaths),
+         new_deaths = coalesce(new_deaths,deaths)
+         ) %>%
+  ungroup() %>%
+  dplyr::select(-cases,-deaths) -> dat5
+
+rbind(dat5, dat_nyc) -> dat6
+
+dat6 %>%
+  group_by(fips) %>%
+  summarise(count=1) %>% nrow()
+```
+
+Fips data is added back, including state level fips, to the data set.
+
+```{r expand_fips}
+# List of county level fips
+utils::read.csv(system.file("extdata", "county_fips.csv", package = "usmap")) %>%
+  filter(abbr %in% c(state.abb,"DC")) -> county_fips
+utils::read.csv(system.file("extdata", "state_fips.csv", package = "usmap")) %>%
+  dplyr::select(abbr,state_fips=fips) -> state_fips
+
+dat6 %>%
+  left_join(county_fips) %>%
+  left_join(state_fips) -> dat7
+
+dat7 %>%
+  group_by(fips) %>%
+  summarise(count=1) %>% nrow()
+```
+
+## Calculate corrected CFR
+
+We would like to calculate the adjusted Case Fatality Rate. To do this, we use a method developed by [Nishiura et al.](https://www.ncbi.nlm.nih.gov/pubmed/19718434) and expanded upon by [Russell et al.](https://www.ncbi.nlm.nih.gov/pubmed/32234121), where case and death incidence data are used to estimate the number of cases with known outcomes, i.e. cases where the resolution, death or recovery, is known to have occurred:
+
+$$u_t = \frac{\sum_{i=0}^{t} \sum_{j=0}^{\infty} c_{i-j}f_j}{\sum_{i=0}^{t} c_{j}}$$
+
+where $c_t$ is the daily case incidence at time $t$, (with time measured in calendar days), $f_t$ is the proportion of cases with delay $t$ between onset or hospitalisation and death; $u_t$ represents the underestimation of the known outcomes and is used to scale the value of the cumulative number of cases in the denominator in the calculation of the cCFR.
+
+We need an updated distribution of time from hospitalisation to death. [Russell et al.](https://www.ncbi.nlm.nih.gov/pubmed/32234121) used the estimated distribution in 
+[Linton et al.](https://www.ncbi.nlm.nih.gov/pubmed/32079150), which featured a lognormal distribution from 39 deaths, with a mean of 13 days, median of 9.1, and a standard deviation of 12.7. However, this distribution is only based on data from China up until the end of January 2020.
+
+Instead, for the United States, we look to a preprint working with data from Washington and California, which featured a weibull distribution from 119 deaths, covering the epidemic until mid April 2020. In this paper, [Lewnard et al.](https://www.medrxiv.org/content/10.1101/2020.04.12.20062943v1) fits the models conditionally on age resulting in a Weibull distribution for each age group. The overall distribution was obtained empirically by weighting the densities at time $t$ across all age groups. Because of this, the overall distribution doesn't have its own shape/scale parameters. However, we were able to estimate what these parameters would be by fitting a Weibull distribution that captures the 2.5, 25, 50, 75, and 97.5 percentiles, along with the average. We contacted the authors to obtain their most updated percentiles:
+
+\[
+\begin{aligned}
+2.5 \% &= 1.6\\
+25 \% &= 7.3\\
+50 \% &= 12.7\\
+75 \% &= 19.8\\
+97.5 \% &= 37.4\\
+\text{Mean} &= 14.5
+\end{aligned}
+\]
+
+We were able to find a Weibull distribution that fit each of these, except for the 97.5 percentile, which was difficult to capture outside of the conditional age structure.
+
+```{r dist,warning=FALSE}
+shape = 1.574
+scale = 16.092
+
+scale*gamma(1+(1/shape)) -> dist_mean
+sqrt(scale^2*(gamma(1+(2/shape))-(gamma(1+(1/shape)))^2)) -> dist_sd
+scale^2*(gamma(1+(2/shape))-(gamma(1+(1/shape)))^2) -> dist_var
+
+#weibullparinv(fw$estimate[1], fw$estimate[2], loc = 0)
+scale*(-log(1-.025))^(1/shape) -> dist_p025
+scale*(-log(1-.25))^(1/shape) -> dist_p250
+scale*(-log(1-.5))^(1/shape) -> dist_p500
+scale*(-log(1-.75))^(1/shape) -> dist_p750
+scale*(-log(1-.975))^(1/shape) -> dist_p975
+
+data_frame(Statistic=c("2.5%","25.0%","50.0%","75.0%","97.5%","Mean"),
+           Value=c(dist_p025,dist_p250,dist_p500,dist_p750,dist_p975,dist_mean)) %>%
+  mutate_if(is.numeric, format, digits=2,nsmall = 0) ->table1
+
+kableExtra::kable(table1,caption="shape = 1.574, scale = 16.092", booktabs = T) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  kableExtra::pack_rows("",1, 6)
+```
+
+Going from [Russell et al.](https://www.ncbi.nlm.nih.gov/pubmed/32234121), we calculate the corrected CFR. For counties where the adjusted case total is less than 15, we set these to 0, as CFR can appear very high when very few deaths have occured within a small population of cases.
+
+To be able to use the cCFR, we need to make sure the estimation has converged and stabilized. Counties where the cCFR have not converged need to be removed from the study as these are not unbiased estimated of the true CFR.
+
+```{r cCFR}
+# Hospital to death distribution
+hospitalisation_to_death_truncated <- function(x) {
+  pweibull(x + 1, shape, scale) - pweibull(x, shape, scale)
+}
+
+# Function to work out correction CFR
+scale_cfr <- function(data_1_in, delay_fun){
+  case_incidence <- data_1_in$new_cases
+  death_incidence <- data_1_in$new_deaths
+  cumulative_known_t <- 0 # cumulative cases with known outcome at time tt
+  # Sum over cases up to time tt
+  for(ii in 1:nrow(data_1_in)){
+    known_i <- 0 # number of cases with known outcome at time ii
+    for(jj in 0:(ii - 1)){
+      known_jj <- (case_incidence[ii - jj]*delay_fun(jj))
+      known_i <- known_i + known_jj
+    }
+    cumulative_known_t <- cumulative_known_t + known_i # Tally cumulative known
+  }
+  # naive CFR value
+  b_tt <- sum(death_incidence)/sum(case_incidence) 
+  # corrected CFR estimator
+  p_tt <- sum(death_incidence)/cumulative_known_t
+  data.frame(nCFR = b_tt, cCFR = p_tt, total_deaths = sum(death_incidence), 
+             adj_total_cases = round(cumulative_known_t), total_cases = sum(case_incidence))
+}
+
+#Calculate cCFRs over time
+dat7 %>%
+  group_by(fips) %>%
+  mutate(day = difftime(date,min(date), units = "days")+1) %>%
+  ungroup() %>%
+  arrange(day,fips) -> dat8
+
+# Loop
+Sys.time()
+pomp2::bake(file="data/CFR_calc.rds",{
+  desired_length <- as.numeric(max(dat8$day)) # or whatever length you want
+  datalist <- vector(mode = "list", length = desired_length)
+  
+for(i in seq(1:desired_length)) {
+  dat8 %>%
+    group_by(fips) %>%
+    filter(day <= i) %>%
+    dplyr::do(scale_cfr(., hospitalisation_to_death_truncated)) %>%
+    ungroup() -> dat_cfr
+  dat_cfr$days <- i  # Fix next time to 'day'
+  datalist[[i]] <- dat_cfr
+  print(i)
+  }
+
+do.call(rbind, datalist)
+}) -> dat_cfr_all
+Sys.time()
+
+dat_cfr_all %>%
+  full_join(dat8 %>%
+              arrange(day,fips) %>%
+              group_by(fips) %>%
+              slice(n()) %>%
+              ungroup() %>%
+              dplyr::select(fips,max_day=day)) %>%
+  filter(days <= max_day) -> dat_cfr_all2
+
+dat_cfr_all2 %>%
+  mutate(a=1,
+         a=cumsum(a)) %>%
+  group_by(a) %>%
+  dplyr::mutate(nCFR_LQ = ifelse(nCFR==0,0,binom.test(total_deaths, total_cases)$conf.int[1]),
+                nCFR_UQ = ifelse(nCFR==0,0,binom.test(total_deaths, total_cases)$conf.int[2]),
+                cCFR_LQ = ifelse((cCFR==0 | total_deaths>adj_total_cases),
+                                 0,binom.test(total_deaths, adj_total_cases)$conf.int[1]),
+                cCFR_UQ = ifelse((cCFR==0 | total_deaths>adj_total_cases),
+                                 0,binom.test(total_deaths, adj_total_cases)$conf.int[2])) %>%
+  ungroup() %>%
+  dplyr::select(-a) -> dat_cfr_all3
+
+dat_cfr_all3 %>%
+  dplyr::select(county_fips=fips,days,CFR=nCFR,CFR_LQ=nCFR_LQ,CFR_UQ=nCFR_UQ) %>%
+  mutate(type = "Naive")->dat_n
+
+dat_cfr_all3 %>%
+  dplyr::select(county_fips=fips,days,CFR=cCFR,CFR_LQ=cCFR_LQ,CFR_UQ=cCFR_UQ) %>%
+  mutate(type = "Corrected")->dat_c
+
+dat_c %>%
+  left_join(county_fips, by=c("county_fips"="fips")) %>%
+  left_join(state_fips) %>%
+  group_by(county_fips) %>%
+  filter(max(days)>14) %>%
+  filter(days> (max(days)-13)) %>%
+  slice((n()-13):n()) %>%
+  group_by(county_fips,full,county) %>%
+  summarise(cCFR_min = min(CFR),
+            cCFR_max = max(CFR),
+            cCFR_diff = cCFR_max-cCFR_min) %>%
+  ungroup() -> d1
+
+d1 %>%
+  filter(cCFR_diff<0.02)->d2
+
+d2 %>% pull(county_fips) -> keep_fips
+```
+
+We can see by ploting the histogram and density, there is a large amount of zeros in our data.
+
+```{r cCFR_dist,warning=FALSE}
+dat_cfr_all %>%
+  filter(fips %in% keep_fips) %>%
+              arrange(fips,days) %>%
+              group_by(fips) %>%
+              slice(n()) %>%
+              ungroup() %>%
+  filter(adj_total_cases>15) %>%
+  #filter(cCFR<0.3) %>%
+  left_join(county_fips) %>%
+  left_join(state_fips) %>%
+  arrange(fips,days) -> dat9
+
+dat9 %>%
+  dplyr::select(county_fips=fips,state_fips,cCFR,adj_total_cases,total_cases,total_deaths,county_name=county,state_name=full) -> cCFR_data
+
+cCFR_data %>% ggplot(aes(x=cCFR)) + geom_histogram() + ylab("Count") + xlab("cCFR")->plot1
+cCFR_data %>% ggplot(aes(x=cCFR)) + geom_density() + ylab("Density") + xlab("cCFR")->plot2
+cCFR_data %>% ggplot(aes(x=cCFR)) + geom_histogram() + scale_y_continuous(trans='log10') + ylab("log(Count)") + xlab("cCFR")->plot3
+cCFR_data %>% ggplot(aes(x=cCFR)) + geom_density() + scale_y_continuous(trans='log10') + ylab("log(Density)") + xlab("cCFR")->plot4
+
+ggpubr::ggarrange(plot1, plot2, plot3, plot4, 
+          labels = c("A", "B", "C", "D"),
+          ncol = 2, nrow = 2)
+```
+
+## Distribution of cCFRs
+
+We would like to use our corrected CFRs in a model where our inputs are variables that likely affect the CFRs seen in each US county. We should take a closer look at the fit of distributions before we go further.
+
+```{r cCFR_dist2,warning=FALSE}
+library(MASS)
+library(DHARMa)
+library("pscl")
+n_sim = 250
+
+# Poisson
+mp <- glm(total_deaths ~ 1,
+          offset = log(adj_total_cases),
+          family = "poisson"(link = "log"),
+          data = cCFR_data)
+
+sim_res_p <- simulateResiduals(fittedModel = mp, n = n_sim)
+plotQQunif(sim_res_p, testOutliers = F)
+
+# Zero Inflated Poisson
+
+mzip <- zeroinfl(total_deaths ~ 1 | 1,
+           offset  = log(adj_total_cases),
+           dist    = "poisson",
+           link    = "log",
+           data    = cCFR_data)
+
+p <- predict(mzip, type = "zero")
+lambda <- predict(mzip, type = "count")
+sim_zip <- replicate(n_sim, ifelse(rbinom(n = nrow(cCFR_data), size = 1, prob = p) > 0, 0, rpois(n = nrow(cCFR_data), lambda = lambda)) )
+
+sim_res_zip <- createDHARMa(simulatedResponse = sim_zip,
+                            observedResponse = cCFR_data$total_deaths,
+                            fittedPredictedResponse = predict(mzip, type = "response"),
+                            integerResponse = TRUE)
+
+plotQQunif(sim_res_zip, testOutliers = F)
+
+# Negative Binomial
+
+mnb <- glm.nb(total_deaths ~ offset(log(adj_total_cases)),
+              link    = "log",
+              data = cCFR_data)
+
+sim_res_nb <- simulateResiduals(fittedModel = mnb, n = n_sim)
+plotQQunif(sim_res_nb, testOutliers = F)
+
+# Zero Inflated Negative Binomial
+
+mzinb <- zeroinfl(total_deaths ~ 1 | 1,
+           offset  = log(adj_total_cases),
+           dist    = "negbin",
+           link    = "log",
+           data    = cCFR_data)
+
+p <- predict(mzinb, type = "zero")
+mus <- predict(mzinb, type = "count")
+
+# library(glmmTMB) # version 0.1.1
+# 
+# fit_zinb = glmmTMB::glmmTMB(total_deaths ~ 1, 
+#                   zi = ~1,
+#                   offset = log(adj_total_cases),
+#                   family = nbinom2(link = "log"), data = cCFR_data)
+# 
+# sim_zinb = simulate(fit_zinb, nsim = n_sim)
+#library(VGAM)
+sim_zinb <- replicate(n_sim, VGAM::rzinegbin(n = nrow(cCFR_data),
+                                   size = mzinb$theta,
+                                   pstr0 = p,
+                                   munb = mus) )
+
+sim_res_zinb <- createDHARMa(simulatedResponse = sim_zinb,
+                            observedResponse = cCFR_data$total_deaths,
+                            fittedPredictedResponse = predict(mzinb, type = "response"),
+                            integerResponse = TRUE)
+
+plotQQunif(sim_res_zinb, testOutliers = F)
+```
+
+The negative binomial models seem to fit the best, but there still may be some issues with the underlying data. Looking at some of the influential data points, there are some outliers. Washington County, Utah appears to have five deaths, according to reports as of June 12, 2020 [1](https://www.stgeorgeutah.com/news/archive/2020/04/25/cdr-first-coronavirus-death-reported-in-washington-county-second-in-southern-utah/), [2](https://www.sltrib.com/news/2020/04/25/two-more-utahns-have-died/), [3](https://www.sltrib.com/news/2020/05/05/utah-reports-six/), [4](https://www.sltrib.com/news/2020/05/19/utah-reports-more-virus/), [5](https://www.cedarcityutah.com/news/archive/2020/06/12/cdr-kane-county-goes-green-with-few-cases-washington-county-sees-death-of-woman-from-covid-19/). We can add this data to the dataset.
+Jones County, Texas houses the ICE Bluebonnet Detention Center. ICE has been accused of transferring sick detainees to other ICE facilities, including [Bluebonnet](https://www.nbcnews.com/politics/immigration/ice-keeps-transferring-detainees-around-country-leading-covid-19-outbreaks-n1212856). Because of the movement of these patients and and no reported deaths, we will likely need to remove this counties from the dataset.
+
+It should be noted that many of these outlier counties are in rural areas with large prisons (Sioux County, Iowa; Platte County, Nebraska; Lincoln County, South Dakota; Bledsoe County, Tennessee; Hardeman County, Tennessee; Lake County, Tennessee; Rhea County, Tennessee; Summit County, Utah). We are unable to speak to the quality of data from these counties.
+
+Both of the negative binomial models fit decently. The AIC for the zero inflated negative binomial is higher by 2, suggesting there is support for choosing the regular negative binomial distribution. We will use this model going forward.
+
+```{r cCFR_dist3,warning=FALSE}
+library(car)
+influence.measures(mnb)->a
+which(apply(a$is.inf, 1, any))
+summary(a)
+as.numeric(names(summary(a)[,1]))->b
+cCFR_data[b,]
+
+
+dat8 %>%
+  filter(fips %in% c(49053)) %>%
+  mutate(new_deaths=0) %>%
+  mutate(new_deaths = ifelse(fips==49053 & date==as.Date("2020-03-26", "%Y-%m-%d"),
+                             1,new_deaths),
+         new_deaths = ifelse(fips==49053 & date==as.Date("2020-04-23", "%Y-%m-%d"),
+                             1,new_deaths),
+         new_deaths = ifelse(fips==49053 & date==as.Date("2020-05-03", "%Y-%m-%d"),
+                             1,new_deaths),
+         new_deaths = ifelse(fips==49053 & date==as.Date("2020-05-18", "%Y-%m-%d"),
+                             1,new_deaths),
+         new_deaths = ifelse(fips==49053 & date==as.Date("2020-06-12", "%Y-%m-%d"),
+                             1,new_deaths)) -> fix_cCFR
+
+desired_length <- as.numeric(max(fix_cCFR$day))
+datalist <- vector(mode = "list", length = desired_length)
+
+for(i in seq(1:desired_length)) {
+  fix_cCFR %>%
+    group_by(fips) %>%
+    filter(day <= i) %>%
+    dplyr::do(scale_cfr(., hospitalisation_to_death_truncated)) %>%
+    ungroup() -> dat_cfr
+  dat_cfr$days <- i  # Fix next time to 'day'
+  datalist[[i]] <- dat_cfr
+  print(i)
+}
+
+do.call(rbind, datalist) -> dat_cfr_fix
+
+dat_cfr_fix %>%
+  full_join(dat8 %>%
+              arrange(day,fips) %>%
+              group_by(fips) %>%
+              slice(n()) %>%
+              ungroup() %>%
+              dplyr::select(fips,max_day=day)) %>%
+  filter(days <= max_day) -> dat_cfr_fix2
+
+dat_cfr_fix2 %>%
+  mutate(a=1,
+         a=cumsum(a)) %>%
+  group_by(a) %>%
+  dplyr::mutate(nCFR_LQ = ifelse(nCFR==0,0,binom.test(total_deaths, total_cases)$conf.int[1]),
+                nCFR_UQ = ifelse(nCFR==0,0,binom.test(total_deaths, total_cases)$conf.int[2]),
+                cCFR_LQ = ifelse((cCFR==0 | total_deaths>adj_total_cases),
+                                 0,binom.test(total_deaths, adj_total_cases)$conf.int[1]),
+                cCFR_UQ = ifelse((cCFR==0 | total_deaths>adj_total_cases),
+                                 0,binom.test(total_deaths, adj_total_cases)$conf.int[2])) %>%
+  ungroup() %>%
+  dplyr::select(-a) -> dat_cfr_fix3
+
+dat_cfr_fix3 %>%
+  dplyr::select(county_fips=fips,days,CFR=nCFR,CFR_LQ=nCFR_LQ,CFR_UQ=nCFR_UQ) %>%
+  mutate(type = "Naive")->dat_n_fix
+
+dat_cfr_fix3 %>%
+  dplyr::select(county_fips=fips,days,CFR=cCFR,CFR_LQ=cCFR_LQ,CFR_UQ=cCFR_UQ) %>%
+  mutate(type = "Corrected")->dat_c_fix
+
+dat_c_fix %>%
+  left_join(county_fips, by=c("county_fips"="fips")) %>%
+  left_join(state_fips) %>%
+  group_by(county_fips) %>%
+  filter(max(days)>14) %>%
+  filter(days> (max(days)-13)) %>%
+  slice((n()-13):n()) %>%
+  group_by(county_fips,full,county) %>%
+  summarise(cCFR_min = min(CFR),
+            cCFR_max = max(CFR),
+            cCFR_diff = cCFR_max-cCFR_min) %>%
+  ungroup() -> d1
+
+d1 %>%
+  filter(cCFR_diff<0.02)->d2
+
+d2 %>% pull(county_fips) -> keep_fips
+
+dat_cfr_fix %>%
+  filter(fips %in% keep_fips) %>%
+              arrange(fips,days) %>%
+              group_by(fips) %>%
+              slice(n()) %>%
+              ungroup() %>%
+  filter(adj_total_cases>15) %>%
+  #filter(cCFR<0.3) %>%
+  left_join(county_fips) %>%
+  left_join(state_fips) %>%
+  arrange(fips,days) -> dat9b
+
+dat9b %>%
+  dplyr::select(county_fips=fips,state_fips,cCFR,adj_total_cases,total_cases,total_deaths,county_name=county,state_name=full) ->dat9c
+cCFR_data %>%
+  filter(!(county_fips %in% c(49053,48253))) %>% #48253,5123,49043,47007,47069,47095,48253,
+  rbind(dat9c) -> cCFR_data2
+
+# Poisson
+mp <- glm(total_deaths ~ 1,
+          offset = log(adj_total_cases),
+          family = "poisson"(link = "log"),
+          data = cCFR_data2)
+
+sim_res_p <- simulateResiduals(fittedModel = mp, n = n_sim)
+plotQQunif(sim_res_p, testOutliers = F)
+
+# Zero Inflated Poisson
+
+mzip <- zeroinfl(total_deaths ~ 1 | 1,
+           offset  = log(adj_total_cases),
+           dist    = "poisson",
+           link    = "log",
+           data    = cCFR_data2)
+
+p <- predict(mzip, type = "zero")
+lambda <- predict(mzip, type = "count")
+sim_zip <- replicate(n_sim, ifelse(rbinom(n = nrow(cCFR_data2), size = 1, prob = p) > 0, 0, rpois(n = nrow(cCFR_data2), lambda = lambda)) )
+
+sim_res_zip <- createDHARMa(simulatedResponse = sim_zip,
+                            observedResponse = cCFR_data2$total_deaths,
+                            fittedPredictedResponse = predict(mzip, type = "response"),
+                            integerResponse = TRUE)
+
+plotQQunif(sim_res_zip, testOutliers = F)
+
+# Negative Binomial
+
+mnb <- glm.nb(total_deaths ~ offset(log(adj_total_cases)),
+              link    = "log",
+              data = cCFR_data2)
+
+sim_res_nb <- simulateResiduals(fittedModel = mnb, n = n_sim)
+plotQQunif(sim_res_nb, testOutliers = F)
+
+# Zero Inflated Negative Binomial
+
+mzinb <- zeroinfl(total_deaths ~ 1 | 1,
+           offset  = log(adj_total_cases),
+           dist    = "negbin",
+           link    = "log",
+           data    = cCFR_data2)
+
+p <- predict(mzinb, type = "zero")
+mus <- predict(mzinb, type = "count")
+
+#library(VGAM)
+sim_zinb <- replicate(n_sim, VGAM::rzinegbin(n = nrow(cCFR_data2),
+                                   size = mzinb$theta,
+                                   pstr0 = p,
+                                   munb = mus) )
+
+sim_res_zinb <- createDHARMa(simulatedResponse = sim_zinb,
+                            observedResponse = cCFR_data2$total_deaths,
+                            fittedPredictedResponse = predict(mzinb, type = "response"),
+                            integerResponse = TRUE)
+
+plotQQunif(sim_res_zinb, testOutliers = F)
+
+# NB AIC
+(-1)*(mnb$twologlik)+2*1
+# ZINB AIC
+(-2)*(mzinb$loglik)+2*2
+
+((-2)*(mzinb$loglik)+2*2)-((-1)*(mnb$twologlik)+2*1)
+
+cCFR_data2 -> cCFR_data
+```
+
+# Input variables
+## Load and select data
+
+Here we load the covariates that have been assembled elsewhere. There are several classes of variables that do not work well will tibbles in R (sfc). These will be removed from the dataset.
+
+```{r load_dep_data}
+county_indicators_2020_06_14 <- readRDS("data/county_indicators_2020-06-14.rds")
+
+read.table("data/hc_hospitals_from_CDC.txt",
+           sep="\t", header=TRUE) %>%
+  filter(Value != -1) %>%
+  dplyr::select(FIPS=cnty_fips, hc_hospitals=Value) -> hc_hospitals_dat
+read.table("data/como_htn_mort_2016_2018.txt",
+           sep="\t", header=TRUE) %>%
+  filter(Value != -1) %>%
+  dplyr::select(FIPS=cnty_fips, como_htn_mort=Value) -> como_htn_mort_dat
+read.table("data/como_htn_hosp_2015_2017.txt",
+           sep="\t", header=TRUE) %>%
+  filter(Value != -1) %>%
+  dplyr::select(FIPS=cnty_fips, como_htn_hosp=Value) -> como_htn_hosp_dat
+read_delim("data/como_stroke_hosp_2015_2017.csv", delim=",",
+           col_names=TRUE,
+           col_types = "icnc") %>%
+  filter(Value != -1) %>%
+  dplyr::select(FIPS=cnty_fips, como_stroke_hosp=Value) -> como_stroke_hosp_dat
+read_delim("data/como_medicareheartdizprev_2017.csv", delim=",",
+           col_names=TRUE,
+           col_types = "icnc") %>%
+  filter(Value != -1) %>%
+  dplyr::select(FIPS=cnty_fips, como_medicareheartdizprev=Value) -> como_medicareheartdizprev_dat
+read_delim("data/como_allheartdis_hosp_2015_2017.csv", delim=",",
+           col_names=TRUE,
+           col_types = "icnc") %>%
+  filter(Value != -1) %>%
+  dplyr::select(FIPS=cnty_fips, como_allheartdis_hosp=Value) -> como_allheartdis_hosp_dat
+read_delim("data/como_cvd_mort_2016_2018.csv", delim=",",
+           col_names=TRUE,
+           col_types = "icnc") %>%
+  filter(Value != -1) %>%
+  dplyr::select(FIPS=cnty_fips, como_cvd_mort=Value) -> como_cvd_mort_dat
+read_delim("data/como_cvd_hosp_2015_2017.csv", delim=",",
+           col_names=TRUE,
+           col_types = "icnc") %>%
+  filter(Value != -1) %>%
+  dplyr::select(FIPS=cnty_fips, como_cvd_hosp=Value) -> como_cvd_hosp_dat
+
+as.data.frame(lapply(county_indicators_2020_06_14, class)) %>%
+  gather(var,value) %>%
+  distinct_all() %>%
+  filter(!(value %in% c("character","factor","numeric","Date"))) %>%
+  distinct(var) %>%
+  pull(var) -> remove_var
+
+# Remove `sfc_MULTIPOLYGON/sfc` object from dataframe
+county_indicators_2020_06_14 %>%
+  dplyr::select(!(all_of(remove_var))) %>%
+  dplyr::select(-hc_hospitals, -como_htn_mort, -como_htn_hosp, -como_stroke_hosp, -como_medicareheartdizprev, -como_allheartdis_hosp, -como_cvd_mort, -como_cvd_hosp) %>%
+  left_join(hc_hospitals_dat) %>%
+  left_join(como_htn_mort_dat) %>%
+  left_join(como_htn_hosp_dat) %>%
+  left_join(como_stroke_hosp_dat) %>%
+  left_join(como_medicareheartdizprev_dat) %>%
+  left_join(como_allheartdis_hosp_dat) %>%
+  left_join(como_cvd_mort_dat) %>%
+  left_join(como_cvd_hosp_dat) -> county_indicators1
+
+as.data.frame(lapply(county_indicators_2020_06_14, class)) %>%
+  gather(var,value) %>%
+  distinct_all() %>%
+  group_by(value) %>%
+  summarise(count = n())
+```
+
+There are number of FIPS represented in this dataset that are not found in our cCFR dataset. These appear to be outside of the 50 states and Washington DC (and some are missing that information entirely), so these are removed from the dataset. We also remove FIPS not found within our cCFRs.
+
+```{r extra_fips}
+county_indicators1 %>%
+  full_join(county_fips %>%
+              dplyr::select(fips) %>%
+              mutate(keep=1),by=c("FIPS"="fips")) %>%
+  filter(!is.finite(keep)) -> extra_fips
+
+county_indicators1 %>%
+  full_join(county_fips %>%
+              dplyr::select(fips) %>%
+              mutate(keep=1),by=c("FIPS"="fips")) %>%
+  filter(is.finite(keep)) %>%
+  dplyr::select(-keep) %>%
+  full_join(cCFR_data %>%
+              dplyr::select(county_fips) %>%
+              mutate(keep=1),by=c("FIPS"="county_fips")) %>%
+  filter(is.finite(keep)) %>%
+  dplyr::select(-keep) -> county_indicators2
+
+extra_fips %>%
+  dplyr::select(FIPS, county.name, state.name)
+```
+
+Select variables that are represented in the variable selection [document](https://docs.google.com/spreadsheets/d/1QBM8XD-omAFdH78-tYxysfmT0JkAbZkvYnO11EvvCN0/edit#gid=0).
+
+The variables `npi_keystone_lockdown`, `npi_keystone_Other`, `npi_keystone_gathering_size_25_to_11`, `npi_keystone_gathering_size_500_to_101`, and `npi_keystone_gathering_size_100_to_26` have >50% of values missing. Even if we wanted to impute data, this would not be possible for these variables, so they will be removed.
+
+```{r vars}
+p_missing <- unlist(lapply(county_indicators2, function(x) sum(is.na(x))))/nrow(county_indicators2)
+sort(p_missing[p_missing > 0], decreasing = TRUE)
+
+#summary(county_indicators2$hc_health_occupation_weighted)
+
+county_indicators2 %>%
+  dplyr::select(county_fips=FIPS,state_fips=state.fips.num,county_name=county.name,state_name=state.name,
+         demo_population,demo_landarea,demo_popdensity,demo_p65more,demo_65more,demo_p60more,demo_60more,
+         ses_pnohighschool,ses_hhincome,ses_ppoverty,ses_punemployed,
+         sv_p17below,sv_pdisability,sv_singleparent,sv_pminority,sv_penglish,sv_pmultiunit,sv_pmobilehome,sv_pcrowding,sv_pnovehicle,
+         npi_keystone_closing_of_public_venues,npi_keystone_gathering_size_10_0,npi_keystone_non_essential_services_closure="npi_keystone_non-essential_services_closure",npi_keystone_religious_gatherings_banned,npi_keystone_school_closure,npi_keystone_shelter_in_place,npi_keystone_social_distancing,
+         hc_icubeds_per1000,hc_icubeds_per60more1000,hc_icubeds_per65more1000,hc_pnotinsured_acs,hc_primarycare,hc_primarycare_per1000,hc_medicaid,
+         como_medicareheartdizprev,como_pdiabetes,como_htn_hosp,como_htn_mort,como_cvd_hosp,como_cvd_mort,como_allheartdis_hosp,como_stroke_hosp,como_smoking,como_COPD,como_asthma,como_cancer5yr,
+         demo_bridgedrace_total,demo_bridgedrace_p_whites,demo_bridgedrace_p_blacks,demo_bridgedrace_p_american_indians_alaskan,demo_bridgedrace_p_asians_pacific,demo_bridgedrace_p_hisp) -> county_indicators3
+```
+
+## Input missing Rio Arriba, New Mexico values
+
+The county of Rio Arriba New Mexico is missing several SES values that also do not show up on the [ACS website](https://www.census.gov/quickfacts/fact/table/rioarribacountynewmexico/BZA010217). These were found on [Data US](https://datausa.io/profile/geo/rio-arriba-county-nm) and [FRED Economic Data](https://fred.stlouisfed.org/series/NMRIOA9URN) and added here.
+
+```{r vars2}
+county_indicators3 %>% filter(!is.finite(sv_pnovehicle))
+
+stopifnot(
+  county_indicators3 %>%
+    filter(!is.finite(ses_hhincome) | !is.finite(ses_ppoverty) |
+             !is.finite(sv_pnovehicle)) %>%
+    nrow()==1
+)
+
+county_indicators3 %>%
+  left_join(county_indicators3) %>%
+  mutate(ses_hhincome = ifelse(!is.finite(ses_hhincome), 33422, ses_hhincome),
+         ses_ppoverty = ifelse(!is.finite(ses_ppoverty), 26.4, ses_ppoverty),
+         ses_punemployed = ifelse(!is.finite(ses_punemployed), 5.2, ses_punemployed),
+         sv_pnovehicle = ifelse(!is.finite(sv_pnovehicle), 1.245552, sv_pnovehicle)) -> county_indicators4
+```
+
+## Add race data
+
+We are missing over 10% of the data for race. This may be due to issues that occured when combining datasets. Looking into the original dataset, all counties except the county of Bedford city in Virginia are present. We will recalculate the percentages of races here.
+
+This data is calculated as Bridged Race Groups by CDC, National Center for Health Statistics, [National Vital Statistics System](ftp://ftp.cdc.gov/pub/Health_Statistics/NCHS/nvss/bridged_race/pcen_v2018_y1018.sas7bdat.zip). These are calculated as averages over the time span of 2010-2018.
+
+
+```{r vars_race,warning=FALSE}
+library(sas7bdat)
+#library(pomp2)
+
+pomp2::bake(file="data/pcen_v2018_y1018.rds",{
+  read.sas7bdat("../pcen_v2018_y1018.sas7bdat")}) -> race_dat
+
+full_join(county_fips,
+          race_dat %>%
+            mutate(fips=as.numeric(
+              paste0(str_pad(ST_FIPS, 2, pad = "0"),
+                     str_pad(CO_FIPS, 3, pad = "0")))) %>%
+            dplyr::select(fips) %>%
+            distinct(fips) %>%
+            mutate(present=1)
+          )
+
+library(stringr)
+race_dat %>%
+  mutate(county_fips = as.numeric(
+    paste0(str_pad(ST_FIPS, 2, pad = "0"),
+           str_pad(CO_FIPS, 3, pad = "0")))) %>%
+  dplyr::select(-ST_FIPS, -CO_FIPS, -VINTAGE, -age) %>%
+  group_by(hisp, RACESEX, county_fips) %>%
+  summarise_all(funs(sum)) %>%
+  ungroup() %>%
+  mutate(PopMean = round(rowMeans(
+    dplyr::select(., starts_with("POP")), na.rm = TRUE), digits = 0)) %>%
+  dplyr::select(county_fips, hisp, RACESEX, PopMean) %>%
+  group_by(county_fips) %>%
+  mutate(TotalPop = sum(PopMean),
+         PercentPop = (PopMean/TotalPop)*100) %>%
+  ungroup() %>%
+  dplyr::select(-PopMean, -TotalPop) %>%
+  mutate(RACESEX = plyr::mapvalues(
+    RACESEX,c(1,2,3,4,5,6,7,8),
+    c("whiteM","whiteF","blackM","blackF",
+      "aianM","aianF","apiM","apiF"))) %>%
+  dplyr::rename(hisp_ind = hisp) %>%
+  spread(RACESEX, PercentPop) %>%
+  filter(hisp_ind == 1) %>%
+  mutate(white = whiteM + whiteF,
+         black = blackM + blackF,
+         aian = aianM + aianF,
+         api = apiM + apiF,
+         hisp = 100 - (white + black + aian + api)) %>%
+  dplyr::select(county_fips,
+         demo_bridgedrace_p_whites = white,
+         demo_bridgedrace_p_blacks = black,
+         demo_bridgedrace_p_american_indians_alaskan = aian,
+         demo_bridgedrace_p_asians_pacific = api,
+         demo_bridgedrace_p_hisp = hisp) -> demo_bridgedrace_p
+
+county_indicators4 %>%
+  dplyr::select(-demo_bridgedrace_total,
+         -demo_bridgedrace_p_whites,
+         -demo_bridgedrace_p_blacks,
+         -demo_bridgedrace_p_american_indians_alaskan,
+         -demo_bridgedrace_p_asians_pacific,
+         -demo_bridgedrace_p_hisp) %>%
+  left_join(demo_bridgedrace_p) -> county_indicators5
+```
+
+## Add demographic data
+
+In almost all counties, the number of people over the age of 60 appears to be more than the total number of people in the county. We will recalculate these using the previous dataset from CDC's [National Vital Statistics System](ftp://ftp.cdc.gov/pub/Health_Statistics/NCHS/nvss/bridged_race/pcen_v2018_y1018.sas7bdat.zip).
+
+```{r vars_demo,warning=FALSE}
+county_indicators5 %>%
+  dplyr::select(county_fips, county_name, state_name, demo_population, demo_65more, demo_60more) %>%
+  filter(demo_population<demo_65more)
+
+race_dat %>%
+  mutate(county_fips = as.numeric(
+    paste0(str_pad(ST_FIPS, 2, pad = "0"),
+           str_pad(CO_FIPS, 3, pad = "0")))) %>%
+  dplyr::select(-ST_FIPS, -CO_FIPS, -VINTAGE, -hisp, -RACESEX) %>%
+  mutate(group = ifelse(age >= 65, "demo_p65more",
+                        ifelse(age >= 45, "demo_p45_64",
+                               ifelse(age >= 15, "demo_p15_44", "demo_p14less")))) %>%
+  group_by(group, county_fips) %>%
+  summarise_all(funs(sum)) %>%
+  ungroup() %>%
+  mutate(PopMean = round(rowMeans(
+    dplyr::select(., starts_with("POP")), na.rm = TRUE), digits = 0)) %>%
+  dplyr::select(county_fips, group, PopMean) %>%
+  group_by(county_fips) %>%
+  mutate(TotalPop = sum(PopMean),
+         PercentPop = (PopMean/TotalPop)*100) %>%
+  ungroup()-> demo_dat
+
+demo_dat %>%
+  dplyr::select(county_fips, demo_population=TotalPop) %>%
+  distinct_all() %>%
+  left_join(county_indicators1 %>%
+              dplyr::select(county_fips=FIPS, demo_landarea, hc_hospitals)) %>%
+  mutate(demo_popdensity = demo_population/demo_landarea,
+         hc_hospitals_per10000 = (hc_hospitals/demo_population)*10000) %>%
+  dplyr::select(-demo_landarea,-demo_population) -> demo_population
+
+race_dat %>%
+  mutate(county_fips = as.numeric(
+    paste0(str_pad(ST_FIPS, 2, pad = "0"),
+           str_pad(CO_FIPS, 3, pad = "0")))) %>%
+  dplyr::select(-ST_FIPS, -CO_FIPS, -VINTAGE, -hisp, -RACESEX) %>%
+  mutate(group = ifelse(age >= 60, "demo_p60more",
+                        ifelse(age <= 17, "demo_p17less",0))) %>%
+  group_by(group, county_fips) %>%
+  summarise_all(funs(sum)) %>%
+  ungroup() %>%
+  mutate(PopMean = round(rowMeans(
+    dplyr::select(., starts_with("POP")), na.rm = TRUE), digits = 0)) %>%
+  dplyr::select(county_fips, group, PopMean) %>%
+  group_by(county_fips) %>%
+  mutate(TotalPop = sum(PopMean),
+         PercentPop = (PopMean/TotalPop)*100) %>%
+  ungroup() %>%
+  filter(group != 0) %>%
+  rbind(demo_dat) %>%
+  dplyr::select(-TotalPop) -> demo_dat2
+
+demo_dat2 %>%
+  dplyr::select(-PopMean) %>%
+  spread(group,PercentPop) %>%
+  dplyr::select(county_fips, demo_p15_44, demo_p45_64, demo_p60more, demo_p65more, sv_p17below=demo_p17less) -> demo_percent
+
+county_indicators5 %>%
+  dplyr::select(-demo_population,
+         -demo_popdensity,
+         -demo_p65more,
+         -demo_65more,
+         -demo_p60more,
+         -demo_60more,
+         -sv_p17below) %>%
+  left_join(demo_population) %>%
+  left_join(demo_percent) -> county_indicators6
+```
+
+## Add cancer data
+
+We have many missing values of 5 year cancer prevalence. Some of these are due to changes in FIPS coding, others due to small numbers per county, and others due to the fact the state does not release this data at the county level. For the first issue, we can replace the old FIPS with new ones. For the last issue, we can input data at the state level as a work around found [here](https://statecancerprofiles.cancer.gov/incidencerates/index.php?stateFIPS=00&areatype=state&cancer=001&race=00&sex=0&age=001&year=0&type=incd&sortVariableName=rate&sortOrder=default#results). Together, these take care of all of the missing data points for this variable in our dataset.
+
+```{r vars_cancer}
+read_delim("../como_cancer5yr_fips.csv", delim=",",
+           col_names=TRUE,
+           col_types = "in") %>%
+  mutate(FIPS = plyr::mapvalues(
+    FIPS,c(2201,2232,2270,2280,46113,51917),
+    c(2198,2230,2158,2275,46102,51019))) -> cancer_dat
+
+county_indicators6 %>%
+  dplyr::select(-como_cancer5yr) %>%
+  left_join(cancer_dat, by = c("county_fips"="FIPS")) %>%
+  dplyr::select(state_name, como_cancer5yr) %>%
+  mutate(missing_dat = ifelse(!is.finite(como_cancer5yr),1,0)) %>%
+  group_by(state_name) %>%
+  summarise(missing_percent = sum(missing_dat)/n(),
+            missing_count = sum(missing_dat)) %>%
+  filter(missing_percent>0)
+
+county_indicators6 %>%
+  dplyr::select(-como_cancer5yr) %>%
+  left_join(cancer_dat, by = c("county_fips"="FIPS")) %>%
+  mutate(como_cancer5yr = ifelse(state_name == "Kansas", 464.5,
+                                ifelse(state_name == "Minnesota", 463.8,como_cancer5yr)
+                                )) -> county_indicators7
+```
+
+## Date data
+
+There are a number of dates that may be important indicators in our model, such as when the first case occured in a county. Several of our date variables have missing values, so these are added below. These dates will be transformed to how many days they occured after the first case on the county (sometimes these will occur before the first case and will be negative). States where an intervantion never occured will be given a zero. The variable `npi_keystone_religious_gatherings_banned` is turned into an indicator variable.
+
+```{r vars_dates}
+county_indicators7 %>%
+  dplyr::select(county_fips, county_name, state_name, npi_keystone_religious_gatherings_banned, npi_keystone_shelter_in_place, npi_keystone_social_distancing, npi_keystone_gathering_size_10_0, npi_keystone_non_essential_services_closure, npi_keystone_closing_of_public_venues, npi_keystone_school_closure) %>%
+  left_join(dat8 %>%
+              dplyr::select(county_fips=fips,date,days_since_first_case=day) %>%
+    arrange(county_fips,date) %>%
+    group_by(county_fips) %>%
+    slice(n()) %>%
+    ungroup() %>%
+    dplyr::select(-date)) %>%
+  left_join(dat8 %>%
+              dplyr::select(county_fips=fips,date_first_case=date) %>%
+    arrange(county_fips,date_first_case) %>%
+    group_by(county_fips) %>%
+    slice(1) %>%
+    ungroup()) %>%
+  mutate(days_since_first_case = as.numeric(days_since_first_case),
+         npi_keystone_gathering_size_10_0 = if_else(state_name=="Arizona",
+                              as.Date("2020-03-17", "%Y-%m-%d"),
+                              npi_keystone_gathering_size_10_0),
+         npi_keystone_social_distancing = if_else(state_name=="Delaware",
+                              as.Date("2020-06-01", "%Y-%m-%d"),
+                              npi_keystone_social_distancing),
+         npi_keystone_social_distancing = if_else(state_name=="Iowa",
+                              as.Date("2020-04-27", "%Y-%m-%d"),
+                              npi_keystone_social_distancing),
+         npi_keystone_social_distancing = if_else(state_name=="Maryland",
+                              as.Date("2020-03-30", "%Y-%m-%d"),
+                              npi_keystone_social_distancing),
+         npi_keystone_gathering_size_10_0 = if_else(state_name=="Michigan",
+                              as.Date("2020-04-09", "%Y-%m-%d"),
+                              npi_keystone_gathering_size_10_0),
+         npi_keystone_gathering_size_10_0 = if_else(state_name=="Minnesota",
+                              as.Date("2020-03-27", "%Y-%m-%d"),
+                              npi_keystone_gathering_size_10_0),
+         npi_keystone_social_distancing = if_else(state_name=="Montana",
+                              as.Date("2020-03-28", "%Y-%m-%d"),
+                              npi_keystone_social_distancing),
+         npi_keystone_gathering_size_10_0 = if_else(state_name=="Montana",
+                              as.Date("2020-03-28", "%Y-%m-%d"),
+                              npi_keystone_gathering_size_10_0),
+         npi_keystone_social_distancing = if_else(state_name=="Nebraska",
+                              as.Date("2020-04-10", "%Y-%m-%d"),
+                              npi_keystone_social_distancing),
+         npi_keystone_gathering_size_10_0 = if_else(state_name=="New Jersey",
+                              as.Date("2020-03-21", "%Y-%m-%d"),
+                              npi_keystone_gathering_size_10_0),
+         npi_keystone_shelter_in_place = if_else(state_name=="New York",
+                              as.Date("2020-03-23", "%Y-%m-%d"),
+                              npi_keystone_shelter_in_place),
+         npi_keystone_gathering_size_10_0 = if_else(state_name=="Ohio",
+                              as.Date("2020-04-07", "%Y-%m-%d"),
+                              npi_keystone_gathering_size_10_0),
+         npi_keystone_social_distancing = if_else(state_name=="Oklahoma",
+                              as.Date("2020-04-24", "%Y-%m-%d"),
+                              npi_keystone_social_distancing),
+         npi_keystone_non_essential_services_closure = if_else(state_name=="Oklahoma",
+                              as.Date("2020-04-01", "%Y-%m-%d"),
+                              npi_keystone_non_essential_services_closure),
+         npi_keystone_social_distancing = if_else(state_name=="Pennsylvania",
+                              as.Date("2020-04-15", "%Y-%m-%d"),
+                              npi_keystone_social_distancing),
+         npi_keystone_gathering_size_10_0 = if_else(state_name=="Pennsylvania",
+                              as.Date("2020-05-08", "%Y-%m-%d"),
+                              npi_keystone_gathering_size_10_0),
+         npi_keystone_social_distancing = if_else(state_name=="Rhode Island",
+                              as.Date("2020-03-26", "%Y-%m-%d"),
+                              npi_keystone_social_distancing),
+         npi_keystone_social_distancing = if_else(state_name=="Tennessee",
+                              as.Date("2020-05-01", "%Y-%m-%d"),
+                              npi_keystone_social_distancing),
+         npi_keystone_social_distancing = if_else(state_name=="Washington",
+                              as.Date("2020-03-23", "%Y-%m-%d"),
+                              npi_keystone_social_distancing)) -> dates_dat
+
+dates_dat %>%
+  mutate(npi_keystone_religious_gatherings_banned_ind = 
+           ifelse(!is.finite(npi_keystone_religious_gatherings_banned),0,1),
+         npi_keystone_shelter_in_place =
+           ifelse(!is.finite(npi_keystone_shelter_in_place), 0,
+                  difftime(npi_keystone_shelter_in_place,
+                           date_first_case, units = "days")),
+         npi_keystone_social_distancing =
+           ifelse(!is.finite(npi_keystone_social_distancing), 0,
+                  difftime(npi_keystone_social_distancing,
+                           date_first_case, units = "days")),
+         npi_keystone_gathering_size_10_0 =
+           ifelse(!is.finite(npi_keystone_gathering_size_10_0), 0,
+                  difftime(npi_keystone_gathering_size_10_0,
+                           date_first_case, units = "days")),
+         npi_keystone_non_essential_services_closure =
+           ifelse(!is.finite(npi_keystone_non_essential_services_closure), 0,
+                  difftime(npi_keystone_non_essential_services_closure,
+                           date_first_case, units = "days")),
+         npi_keystone_closing_of_public_venues =
+           ifelse(!is.finite(npi_keystone_closing_of_public_venues), 0,
+                  difftime(npi_keystone_closing_of_public_venues,
+                           date_first_case, units = "days")),
+         npi_keystone_school_closure =
+           ifelse(!is.finite(npi_keystone_school_closure), 0,
+                  difftime(npi_keystone_school_closure,
+                           date_first_case, units = "days"))) %>%
+  dplyr::select(-npi_keystone_religious_gatherings_banned, -date_first_case, -county_name, -state_name) -> dates_dat2
+
+# Arizona 10 less people gatherings 3/17/2020
+# https://www.azdhs.gov/documents/preparedness/epidemiology-disease-control/infectious-disease-epidemiology/novel-coronavirus/eo-stay-home-stay-healthy-stay-connected.pdf
+
+# Delaware social distancing 6/1/2020
+# https://governor.delaware.gov/health-soe/twentieth-state-of-emergency/
+
+# Iowa social distancing 4/27/2020
+# https://governor.iowa.gov/press-release/gov-reynolds-signs-new-proclamation-continuing-the-state-public-health-emergency-0
+
+# Maryland social distancing 3/30/2020
+# https://governor.maryland.gov/wp-content/uploads/2020/03/Gatherings-FOURTH-AMENDED-3.30.20.pdf
+
+# Michigan 10 less people gatherings 4/9/2020
+# https://content.govdelivery.com/attachments/MIEOG/2020/04/09/file_attachments/1423850/EO%202020-42.pdf
+
+# Minnesota 10 less people gatherings 3/27/2020
+# https://www.mprnews.org/story/2020/03/25/minnesotas-covid19-stayathome-order-what-you-need-to-know
+
+# Montana social distancing 3/28/2020
+# http://governor.mt.gov/Portals/16/Closure%20Extensions%20and%20Social%20Distancing.pdf?ver=2020-03-24-164313-497
+# Montana 10 less people gatherings 3/28/2020
+# https://www.greatfallstribune.com/story/news/2020/03/24/number-coronavirus-cases-montana-now-46/2906721001/
+
+# North Dakota
+
+# Nebraska social distancing 4/10/2020
+# https://governor.nebraska.gov/press/gov-ricketts-proclaims-%E2%80%9C21-days-stay-home-and-stay-healthy%E2%80%9D-unveils-six-rules-keep-nebraska
+
+# New Jersey 10 less people gatherings 3/21/2020
+# https://nj.gov/governor/news/ao/docs/AO%202020-4%20Gatherings.pdf
+
+# New York stay at home 3/22/2020
+# https://www.newsweek.com/new-york-coronavirus-update-cuomo-extends-stay-home-order-through-april-15-we-have-made-it-1494911
+
+# Ohio 10 less people gatherings 4/7/2020
+# https://www.daytondailynews.com/news/local/ohio-stay-home-extension-starts-today-what-does-mean/Vy8b4XpmJJiL2tVTTEY4gK/
+
+# Oklahoma social distancing 4/24/2020
+# https://www.usnews.com/news/best-states/oklahoma/articles/2020-04-20/oklahoma-health-officials-cite-3-more-deaths-to-covid-19
+# Oklahoma nonessential businesses 4/1/2020
+# https://www.greatfallstribune.com/story/news/2020/03/24/number-coronavirus-cases-montana-now-46/2906721001/
+
+# Pennsylvania social distancing 4/15/2020
+# https://wjactv.com/news/local/wolf-open-pa-businesses-ordered-to-follow-safety-protocols-or-face-fines
+# Pennsylvania 10 less people gatherings 5/8/2020
+# https://www.seyfarth.com/news-insights/Pennsylvania-Governor-Announces-Phased-Reopening-Plan-from-COVID19-Shutdown.html
+
+# Rhode Island social distancing 3/26/2020
+# https://storage.googleapis.com/ridbr_guidelines/Grocer_large_retailer_guidelines-Final.pdf
+
+# South Dakota
+
+# Tennessee social distancing 5/1/2020
+# https://www.wgnsradio.com/updated-mayor-releases-local-guidelines-for-responsible-reopening-under-tennessee-pledge-cms-57852
+
+# Utah
+
+# Washington social distancing 3/23/2020
+# https://www.king5.com/article/news/inslee-gives-stay-at-home-order-for-washington-state/281-64ef0d19-de11-4b75-b77a-48da5db3f7bc
+
+county_indicators7 %>%
+  dplyr::select(-npi_keystone_religious_gatherings_banned,
+         -npi_keystone_shelter_in_place,
+         -npi_keystone_social_distancing,
+         -npi_keystone_gathering_size_10_0,
+         -npi_keystone_non_essential_services_closure,
+         -npi_keystone_closing_of_public_venues,
+         -npi_keystone_school_closure) %>%
+  left_join(dates_dat2) -> county_indicators8
+```
+
+## Remove highly correlated variables
+
+There are many highly correlated variables within our county indicators. We need to pair these down before we can begin to fit our model. For this, we use the ``` caret ``` package to find the best combination to keep correlation below 0.5.
+
+```{r vars_corr,warning=FALSE}
+c("county_fips",setdiff(colnames(county_indicators8),colnames(cCFR_data))) -> depVarList
+
+as.matrix(cor(county_indicators8 %>%
+                dplyr::select(all_of(depVarList)))) -> Data_cor
+arrange(reshape2::melt(Data_cor), -abs(value)) -> Data_cor_melt
+dplyr::filter(Data_cor_melt, value > .5) %>% filter(value<1)
+
+# Remove outcome, offset, and linking variables
+county_indicators8 %>%
+  dplyr::select(all_of(depVarList)) -> depend_vars
+
+# Briefly remove missing data rows to calculate correlations (~7% data)
+depend_vars[complete.cases(depend_vars), ] -> depend_vars_no_miss
+
+#look for linear combinations of variables
+library("caret")
+findLinearCombos(depend_vars_no_miss) -> comboInfo
+comboInfo
+cor(depend_vars_no_miss) -> Data_cor
+findCorrelation(Data_cor, cutoff=0.5) -> hc
+hc
+sort(hc) -> hc
+depend_vars[,-c(hc)] -> county_indicators9
+```
+
+## Impute missing values
+
+We now have 22 dependent variables, 2 with missing values. For each variable, less than 2% of the data is missing. We will use Multiple Imputation to fill in these values.
+
+```{r imp_miss_dat,warning=FALSE}
+p_missing <- unlist(lapply(county_indicators9, function(x) sum(is.na(x))))/nrow(county_indicators9)
+sort(p_missing[p_missing > 0], decreasing = TRUE)
+
+library(mice)
+pomp2::bake(file="data/imp_data.rds",{
+  mice(county_indicators9, maxit = 5, method = "midastouch", print =  FALSE)
+  }) -> imp
+
+county_indicators9 %>%
+  dplyr::select(como_htn_mort,
+         hc_primarycare) %>%
+  gather(var, value) %>%
+  mutate(Imputation = "No") -> without_imp
+
+complete(imp,5) %>%
+  dplyr::select(como_htn_mort,
+         hc_primarycare) %>%
+  gather(var, value) %>%
+  mutate(Imputation = "Yes") %>%
+  rbind(without_imp) %>%
+  mutate(Imputation = as.factor(Imputation)) %>%
+  ggplot() + geom_density(aes(x=value, group=Imputation, color=Imputation)) +
+  facet_wrap(~var, scales = "free")
+
+complete(imp,5) -> county_indicators_clean
+
+county_indicators_clean %>% dplyr::select(-county_fips) %>% gather(var,value) %>% ggplot() + geom_histogram(aes(x=value)) + facet_wrap(~var, scales = "free")
+```
+
+# Variable Selection
+## Bivariate analysis
+
+We divide our data randomly into a training set containing 2/3's of the data, and a testing set containing 1/3 of the data. This will be used later to assess prediction.
+
+In model building with clinical data, it is often difficult to retain clinically significant variables and well as confounders using traditional Forward, Backward, or Stepwise Selection ( [Bursac et al., 2008](https://pubmed.ncbi.nlm.nih.gov/19087314/) ). For model building, we will be using Purposeful Selection described by Hosmer and Lemeshow that allows analysts to make decisions on variable selection during each step of model building ( [Hosmer and Lemeshow, 2000](https://www.researchgate.net/profile/Andrew_Cucchiara/publication/261659875_Applied_Logistic_Regression/links/542c7eff0cf277d58e8c811e/Applied-Logistic-Regression.pdf), [Hosmer and Lemeshow, 1999](https://dl.acm.org/doi/book/10.5555/553070) ). In the first step of Purposeful Selection, we fit bivariable models for each of the predictor variables. We will remove all predictors with p-values greater that 0.25.
+
+```{r bivar,warning=FALSE}
+cCFR_data %>%
+  full_join(county_indicators_clean) %>%
+  mutate(county_fips        = as.factor(county_fips),
+         state_fips         = as.factor(state_fips),
+         adj_total_cases    = as.integer(adj_total_cases),
+         total_deaths       = as.integer(total_deaths),
+         npi_keystone_social_distancing =
+                           as.integer(npi_keystone_social_distancing),
+         npi_keystone_religious_gatherings_banned_ind =
+                           as.factor(npi_keystone_religious_gatherings_banned_ind)) -> dat_clean
+
+# Randomly assign 2/3's of data to training set, other 1/3 to testing set
+set.seed(126943L)
+sample(1:nrow(dat_clean), size = round(nrow(dat_clean)*(2/3),digits = 0), replace = F) -> rows_training
+dat_clean[rows_training,] -> dat_training
+dat_clean[-rows_training,] -> dat_testing
+
+# write.csv(dat_training, file="dat_training.csv" )
+
+setdiff(colnames(dat_training),colnames(cCFR_data)) -> depVarList
+
+formulas = lapply(depVarList, function(x){
+  paste0("total_deaths ~ ", x, " + offset(log(adj_total_cases))")
+  })
+
+allModels = lapply(as.vector(formulas), function(x){
+  glm.nb(formula = as.formula(x),
+           link    = "log",
+           data    = dat_training)
+  })
+
+names(allModels) = depVarList
+
+setNames(data.frame(matrix(ncol = 5, nrow = 0)), c("Variable", "Coeff.", "St. Error","Wald","p value")) -> bivar_table
+
+for(i in seq(1:length(depVarList))) {
+  bivar_table[i, ] <- c(depVarList[i],
+    unname(stats::coef(summary(allModels[[i]]))[2,], force = FALSE))
+}
+
+bivar_table %>%
+  mutate(`p value` = as.numeric(`p value`)) %>%
+  filter(`p value` < 0.25) -> bivar_sig
+
+bivar_table %>%
+  mutate(Coeff.      = as.numeric(Coeff.),
+         `St. Error` = as.numeric(`St. Error`),
+         Wald        = as.numeric(Wald),
+         `p value`   = as.numeric(`p value`)) %>%
+  arrange(`p value`) %>%
+  mutate(`p value` = if_else(`p value` < 0.01, 
+                             formatC(`p value`, digits = 4, format = "e"),
+                             formatC(`p value`, digits = 4, format = "f", drop0trailing = FALSE))
+         ) %>%
+  mutate_if(is.numeric, function(x) {
+    formatC(x, digits = 4, format = "f", drop0trailing = FALSE)
+    })-> bivar_table2
+
+kableExtra::kable(bivar_table2,caption="Bivariate Statistics", booktabs = T, align = c("l","r","r","r","l")) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  kableExtra::pack_rows("Significant at 0.25 level", 1, nrow(bivar_sig)) %>%
+  kableExtra::pack_rows("Not significant at 0.25 level", nrow(bivar_sig)+1, nrow(bivar_table))
+
+bivar_table %>%
+  mutate(`p value` = as.numeric(`p value`)) %>%
+  filter(`p value` >= 0.25) %>%
+  dplyr::select(Variable) %>%
+  pull(Variable) -> remove_var
+
+dat_training %>%
+  dplyr::select(!(all_of(remove_var))) -> dat_training2
+```
+
+## Preliminary variable selection
+
+Next we will fit an initial multivariable model and look at each of the Wald test statistics. We will remove all predictors with p-values greater that 0.1.
+
+The variables ``` sv_pnovehicle ```, ``` como_medicareheartdizprev ```, ``` ses_punemployed ```, ``` sv_pcrowding ```, ``` hc_icubeds_per60more1000 ```, ``` como_cancer5yr ```, and ``` npi_keystone_social_distancing ``` have a p-value above the cutoff, suggesting they should be dropped from the multivariable model.
+
+```{r prelim_select,warning=FALSE}
+setdiff(colnames(dat_training2),colnames(cCFR_data)) -> depVarList
+
+formula = paste0("total_deaths ~ ", paste(depVarList, collapse = ' + '), " + offset(log(adj_total_cases))")
+
+multivar_model = glm.nb(formula = as.formula(formula),
+           link    = "log",
+           data    = dat_training2)
+
+cbind(c("Intercept",depVarList),
+      as.data.frame(unname(stats::coef(summary(multivar_model)), force = FALSE)) %>%
+  dplyr::rename(Coeff.      = V1,
+                `St. Error` = V2,
+                Wald        = V3,
+                `p value`   = V4)) -> multivar_table
+colnames(multivar_table)[1] <- "Variable"
+
+multivar_table %>%
+  filter(`p value` < 0.1) -> multivar_sig
+
+multivar_table %>%
+  arrange(`p value`) %>%
+  mutate(`p value` = if_else(`p value` < 0.01,
+                             formatC(`p value`, digits = 4, format = "e"),
+                             formatC(`p value`, digits = 4, format = "f", drop0trailing = FALSE))
+         ) %>%
+  mutate_if(is.numeric, function(x) {
+    formatC(x, digits = 4, format = "f", drop0trailing = FALSE)
+    })-> multivar_table_cl
+
+kableExtra::kable(multivar_table_cl,caption="Multivariable Model", booktabs = T, align = c("l","r","r","r","l")) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  kableExtra::pack_rows("Significant at 0.1 level", 1, nrow(multivar_sig)) %>%
+  kableExtra::pack_rows("Not significant at 0.1 level", nrow(multivar_sig)+1, nrow(multivar_table))
+
+multivar_table %>%
+  filter(`p value` >= 0.1) %>%
+  dplyr::select(Variable) %>%
+  pull(Variable) -> remove_var
+
+dat_training2 %>%
+  dplyr::select(!(all_of(remove_var))) -> dat_training3
+```
+
+Once we remove the variables from the model, we can see that all of our variables appear to be significant, according to their Wald statistic.
+
+To check and see if the previous variables had a significant effect on the overall model, we run a Likelihood Ratio Test on the multivariable model with and without the previous variables. The test is not significant.
+
+```{r prelim_select2,warning=FALSE}
+setdiff(colnames(dat_training3),colnames(cCFR_data)) -> depVarList
+
+formula = paste0("total_deaths ~ ", paste(depVarList, collapse = ' + '), " + offset(log(adj_total_cases))")
+multivar_model2 = glm.nb(formula = as.formula(formula),
+           link    = "log",
+           data    = dat_training3)
+
+cbind(c("Intercept",depVarList),
+      as.data.frame(unname(stats::coef(summary(multivar_model2)), force = FALSE)) %>%
+  dplyr::rename(Coeff.      = V1,
+                `St. Error` = V2,
+                Wald        = V3,
+                `p value`   = V4)) -> multivar_table2
+colnames(multivar_table2)[1] <- "Variable"
+
+multivar_table2 %>%
+  filter(`p value` < 0.1) -> multivar_sig2
+
+multivar_table2 %>%
+  arrange(`p value`) %>%
+  mutate(`p value` = if_else(`p value` < 0.01,
+                             formatC(`p value`, digits = 4, format = "e"),
+                             formatC(`p value`, digits = 4, format = "f", drop0trailing = FALSE))
+         ) %>%
+  mutate_if(is.numeric, function(x) {
+    formatC(x, digits = 4, format = "f", drop0trailing = FALSE)
+    })-> multivar_table2_cl
+
+kableExtra::kable(multivar_table2_cl,caption="Multivariable Model", booktabs = T, align = c("l","r","r","r","l")) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  kableExtra::pack_rows("Significant at 0.1 level", 1, nrow(multivar_sig2)) #%>%
+  #kableExtra::pack_rows("Not significant at 0.1 level", nrow(multivar_sig2)+1, nrow(multivar_table2))
+
+# Likelihood ratio test
+pchisq((-2)*(as.numeric(logLik(multivar_model2)) - as.numeric(logLik(multivar_model))),
+       df =  length(remove_var), lower.tail=FALSE)
+```
+
+## Testing for confounders
+
+Now we go back and test whether any of the variables we have removed in the previous step are confounders in our model. We check the change in coefficients in our reduced model from the previous step with and without a removed variable. Any coefficient change above 20% could be a cofounder.
+
+Since no changes in coefficients exceed 20%, we will not consider any of these variables confounders.
+
+```{r confounders,warning=FALSE}
+setdiff(colnames(dat_training3),colnames(cCFR_data)) -> depVarList_kept
+
+remove_var -> depVarList
+
+formulas = lapply(depVarList, function(x){
+  paste0("total_deaths ~ ", x, " + ", paste(depVarList_kept, collapse = ' + '), " + offset(log(adj_total_cases))")
+  })
+
+allModels = lapply(as.vector(formulas), function(x){
+  glm.nb(formula = as.formula(x),
+           link    = "log",
+           data    = dat_training)
+  })
+
+names(allModels) = depVarList
+
+cbind(unname(coef(summary(allModels[[1]]))[3:(2+length(depVarList_kept)),1], force = FALSE),
+      unname(coef(summary(allModels[[2]]))[3:(2+length(depVarList_kept)),1], force = FALSE),
+      unname(coef(summary(allModels[[3]]))[3:(2+length(depVarList_kept)),1], force = FALSE),
+      unname(coef(summary(allModels[[4]]))[3:(2+length(depVarList_kept)),1], force = FALSE),
+      unname(coef(summary(allModels[[5]]))[3:(2+length(depVarList_kept)),1], force = FALSE),
+      unname(coef(summary(allModels[[6]]))[3:(2+length(depVarList_kept)),1], force = FALSE),
+      unname(coef(summary(allModels[[7]]))[3:(2+length(depVarList_kept)),1], force = FALSE)) -> models_conf
+colnames(models_conf) <- depVarList
+
+multivar_table2 %>%
+  dplyr::select(Variable, orig_model = Coeff.) %>%
+  filter(Variable != "Intercept") %>%
+  cbind(models_conf) %>%
+  gather(var, value, -Variable, -orig_model) %>%
+  mutate(change = abs((orig_model-value)/value)) %>%
+  arrange(desc(change))
+```
+
+## Add back excluded variables
+
+At this point we will add back any variables that were excluded in step 1, and check their Wald statistic. The purpose is to identify variables that are not significant alone but are significant in the presence of other variables. The variable ``` demo_bridgedrace_p_american_indians_alaskan ``` appears to have a significant Wald statistics once added back to the multivariable model. The Likelihood Ratio Tests for inclusion is not significant at the 0.05 level, so we will not include it.
+
+```{r add_back_vars,warning=FALSE}
+bivar_table %>%
+  mutate(`p value` = as.numeric(`p value`)) %>%
+  filter(`p value` >= 0.25) %>%
+  dplyr::select(Variable) %>%
+  pull(Variable) -> depVarList_old
+c(as.character(depVarList), depVarList_old)-> depVarList
+
+setdiff(colnames(dat_training3),colnames(cCFR_data)) -> depVarList_kept
+
+formulas = lapply(depVarList, function(x){
+  paste0("total_deaths ~ ", x, " + ", paste(depVarList_kept, collapse = ' + '), " + offset(log(adj_total_cases))")
+  })
+
+allModels = lapply(as.vector(formulas), function(x){
+  glm.nb(formula = as.formula(x),
+           link    = "log",
+           data    = dat_training)
+  })
+
+names(allModels) = depVarList
+
+setNames(data.frame(matrix(ncol = 5, nrow = 0)), c("Variable", "Coeff.", "St. Error","Wald","p value")) -> multivar_table_compare
+
+for(i in seq(1:length(depVarList))) {
+  multivar_table_compare[i, ] <- c(depVarList[i],
+    unname(coef(summary(allModels[[i]]))[2,], force = FALSE))
+}
+
+multivar_table_compare %>%
+  mutate(`p value` = as.numeric(`p value`)) %>%
+  filter(`p value` < 0.1) -> multivar_compare_sig
+
+multivar_table_compare %>%
+  mutate(Coeff.      = as.numeric(Coeff.),
+         `St. Error` = as.numeric(`St. Error`),
+         Wald        = as.numeric(Wald),
+         `p value`   = as.numeric(`p value`)) %>%
+  arrange(`p value`) %>%
+  mutate(`p value` = if_else(`p value` < 0.01, 
+                             formatC(`p value`, digits = 4, format = "e"),
+                             formatC(`p value`, digits = 4, format = "f", drop0trailing = FALSE))
+         ) %>%
+  mutate_if(is.numeric, function(x) {
+    formatC(x, digits = 4, format = "f", drop0trailing = FALSE)
+    })-> multivar_table_compare2
+
+kableExtra::kable(multivar_table_compare2,caption="multivariable Statistics for Removed Variables", booktabs = T, align = c("l","r","r","r","l")) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  kableExtra::pack_rows("Significant at 0.1 level", 1, nrow(multivar_compare_sig)) %>%
+  kableExtra::pack_rows("Not significant at 0.1 level", nrow(multivar_compare_sig)+1, nrow(multivar_table_compare))
+
+# Likelihood ratio tests
+# demo_bridgedrace_p_american_indians_alaskan
+pchisq((-2)*(as.numeric(logLik(multivar_model2)) - as.numeric(logLik(allModels[[13]]))),
+       df =  1, lower.tail=FALSE)
+
+setdiff(colnames(dat_training3),colnames(cCFR_data)) -> depVarList
+```
+
+# Interpretations
+
+In this model, we have modeled the number of deaths we would expect to occur, given our predictor variables and the adjusted number of cases in a county (the offset variable). The log link is used to rearrange our equation so that count data is our outcome, which can be seen below.
+
+$$
+\begin{aligned}
+\ln\left(\frac{\text{deaths}}{\text{cases}} \right) &= \beta_0 + \sum_i {\beta_i X_i}\\
+\ln\left(\text{deaths} \right) - \ln\left(\text{cases} \right) &= \beta_0 + \sum_i {\beta_i X_i}\\
+\ln\left(\text{deaths} \right) &= \ln\left(\text{cases} \right) + \beta_0 + \sum_i {\beta_i X_i} \end{aligned}
+$$
+
+Once the model is fit, we can move the log of cases back to the left side of the equation, so that our model predicts the average risk of death for people who have been diagnosed with COVID19 in a given county within the United States. Because of the log link, coefficients will need to be exponentiated to be interpreted.
+
+$$
+\begin{aligned}
+\ln\left(\frac{\text{deaths}}{\text{cases}} \right) &= \beta_0 + \sum_i {\beta_i X_i}\\
+\frac{\text{deaths}}{\text{cases}} &=e^{\beta_0 + \sum_i {\beta_i X_i}} \\
+ \end{aligned}
+$$
+
+```{r exp_coef,warning=FALSE}
+cbind(c("Intercept",depVarList),
+      as.data.frame(unname(exp(stats::coef(summary(multivar_model2))), force = FALSE)) %>%
+        dplyr::select(V1) %>%
+  dplyr::rename(`exp(Coeff.)`      = V1)) %>%
+  cbind(as.data.frame(unname(exp(confint(multivar_model2)), force = FALSE))) %>%
+  dplyr::rename(`2.5%`      = V1,
+                `97.5%`     = V2) -> exp_table
+colnames(exp_table)[1] <- "Variable"
+
+kableExtra::kable(exp_table,caption="Multivariable Model", booktabs = T, align = c("l","r","r","r")) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+## Coefficients
+
+How to interpret the intercept? This would be the value if all the other variables were set to 0. So if there were no people over 65, no asthma or heart disease, no blacks, hospitals, or mobile homes, and no ban on religious gatherings, we would expect the average risk of death from COVID19 in a county given a person has been diagnosed to be 0.69%, with a 95% confidence interval of 0.38-1.25%.
+
+For our variables, we can estimate how the average risk of death among COVID-19 cases is affected by a 1 unit increase in the variable. We can visualize these in the graph below.
+
+```{r coeff_compare, echo=FALSE}
+cbind(c("Intercept",depVarList),
+      as.data.frame(unname(exp(stats::coef(summary(multivar_model2))), force = FALSE)) %>%
+        dplyr::select(V1) %>%
+  dplyr::rename(`exp_coeff`      = V1)) %>%
+  cbind(as.data.frame(unname(exp(confint(multivar_model2)), force = FALSE))) %>%
+  dplyr::rename(`lower`      = V1,
+                `upper`     = V2) %>%
+  slice(-1) %>%
+  mutate(change = ifelse(exp_coeff>1,(exp_coeff-1)*100,(1-exp_coeff)*(-100)),
+         change_l = ifelse(lower>1,(lower-1)*100,(1-lower)*(-100)),
+         change_u = ifelse(upper>1,(upper-1)*100,(1-upper)*(-100))) -> coeff_table
+
+colnames(coeff_table)[1] <- "Variable"
+
+coeff_table %>%
+  mutate(Variable = plyr::mapvalues(
+    Variable,c("sv_pmobilehome","hc_pnotinsured_acs","como_asthma","demo_bridgedrace_p_blacks","hc_hospitals","hc_hospitals_per10000","demo_p65more","npi_keystone_religious_gatherings_banned_ind"),
+    c("Mobile Home Pop. (%)","Not Insured ACS (%)","Asthma Pop. (%)","Black Pop. (%)","Hospitals Total","Hospitals per 10,000","Pop. >=65 yrs (%)","Religious Gatherings Ban"))) -> coeff_table2
+
+coeff_table2 %>%
+  ggplot(aes(x=Variable,y=change,label = as.character(round(change,digits = 2)))) + geom_point() + geom_text(hjust = 0, nudge_x = 0.05) +
+  geom_hline(yintercept=0, size=0.5) +
+  geom_errorbar(width=.1, aes(ymin=change_l, ymax=change_u), colour="red") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  ylab("Percent change in cCFR") +
+  ylim(-50, 20)
+```
+
+Going through the predictor variables in our model, some of the coefficients indicate that an increase in that variable will lead to an increased risk of death among cases ( `exp(coeff)>1` ):
+
+A 1% increase in asthma prevalence within a county (all other variables constant), will lead to a 9.51% increase in the average risk of death among cases, with a 95% confidence interval of 4.00-15.33%.
+
+A 1% increase in the population over 65 years old within a county (all other variables constant), will lead to a 4.53% increase in the average risk of death among cases, with a 95% confidence interval of 3.08-6.05%.
+
+A 1% increase in the population that is black within a county (all other variables constant), will lead to a 0.97% increase in the average risk of death among cases, with a 95% confidence interval of 0.62-1.33%.
+
+An increase of 1 hospital within a county (all other variables constant), will lead to a 1.03% increase in the average risk of death among cases, with a 95% confidence interval of 0.99-5.52%.
+
+Other coefficients within the model indicate that an increase in that variable will lead to an decreased risk of death among cases ( `exp(coeff)<1` ):
+
+A 1% increase in the population that live in mobile homes within a county (all other variables constant), will lead to a 0.79% decrease in the average risk of death among cases, with a 95% confidence interval of 0.11-1.46%.
+
+A 1% increase in the population that is not insured within a county (all other variables constant), will lead to a 1.45% decrease in the average risk of death among cases, with a 95% confidence interval of 0.02-2.85%.
+
+Adding 1 more hospital per 10,000 people within a county (all other variables constant), will lead to a 32.27% decrease in the average risk of death among cases, with a 95% confidence interval of 17.52-44.51%.
+
+Counties that banned religious gatherings (all other variables constant) saw a 12.48% reduction in the average risk of death among cases, with a 95% confidence interval of 2.98-21.06%.
+
+## Predictions
+
+To get a better look at the variables and their possible relationships, it is useful to graph the estimated cCFRs with single and multiple variables.
+
+### Individual variables
+
+To create the correct confidence intervals, the variance is calculated using the covariance matrix and the variable values of interest to plug in. For the following graphs, we vary the variable of interest within the range of values we observe in our data and use the median for all other variables. Religious gatherings ban is set to 0.
+
+```{r coeff_asthma, echo=FALSE}
+var_est <- function(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks,
+                    hc_hospitals, hc_hospitals_per10000, demo_p65more,
+                    npi_keystone_religious_gatherings_banned_ind) {
+  vcov(multivar_model2)[1,1] + 
+    (sv_pmobilehome)^2*vcov(multivar_model2)[2,2] +
+    (hc_pnotinsured_acs)^2*vcov(multivar_model2)[3,3] +
+    (como_asthma)^2*vcov(multivar_model2)[4,4] +
+    (demo_bridgedrace_p_blacks)^2*vcov(multivar_model2)[5,5] +
+    (hc_hospitals)^2*vcov(multivar_model2)[6,6] +
+    (hc_hospitals_per10000)^2*vcov(multivar_model2)[7,7] +
+    (demo_p65more)^2*vcov(multivar_model2)[8,8] +
+    (npi_keystone_religious_gatherings_banned_ind)^2*vcov(multivar_model2)[9,9] +
+    
+    2*sv_pmobilehome*vcov(multivar_model2)[1,2] +
+    2*hc_pnotinsured_acs*vcov(multivar_model2)[1,3] +
+    2*como_asthma*vcov(multivar_model2)[1,4] +
+    2*demo_bridgedrace_p_blacks*vcov(multivar_model2)[1,5] +
+    2*hc_hospitals*vcov(multivar_model2)[1,6] +
+    2*hc_hospitals_per10000*vcov(multivar_model2)[1,7] +
+    2*demo_p65more*vcov(multivar_model2)[1,8] +
+    2*npi_keystone_religious_gatherings_banned_ind*vcov(multivar_model2)[1,9] +
+    
+    2*sv_pmobilehome*hc_pnotinsured_acs*vcov(multivar_model2)[2,3] +
+    2*sv_pmobilehome*como_asthma*vcov(multivar_model2)[2,4] +
+    2*sv_pmobilehome*demo_bridgedrace_p_blacks*vcov(multivar_model2)[2,5] +
+    2*sv_pmobilehome*hc_hospitals*vcov(multivar_model2)[2,6] +
+    2*sv_pmobilehome*hc_hospitals_per10000*vcov(multivar_model2)[2,7] +
+    2*sv_pmobilehome*demo_p65more*vcov(multivar_model2)[2,8] +
+    2*sv_pmobilehome*npi_keystone_religious_gatherings_banned_ind*vcov(multivar_model2)[2,9] +
+    
+    2*hc_pnotinsured_acs*como_asthma*vcov(multivar_model2)[3,4] +
+    2*hc_pnotinsured_acs*demo_bridgedrace_p_blacks*vcov(multivar_model2)[3,5] +
+    2*hc_pnotinsured_acs*hc_hospitals*vcov(multivar_model2)[3,6] +
+    2*hc_pnotinsured_acs*hc_hospitals_per10000*vcov(multivar_model2)[3,7] +
+    2*hc_pnotinsured_acs*demo_p65more*vcov(multivar_model2)[3,8] +
+    2*hc_pnotinsured_acs*npi_keystone_religious_gatherings_banned_ind*vcov(multivar_model2)[3,9] +
+    
+    2*como_asthma*demo_bridgedrace_p_blacks*vcov(multivar_model2)[4,5] +
+    2*como_asthma*hc_hospitals*vcov(multivar_model2)[4,6] +
+    2*como_asthma*hc_hospitals_per10000*vcov(multivar_model2)[4,7] +
+    2*como_asthma*demo_p65more*vcov(multivar_model2)[4,8] +
+    2*como_asthma*npi_keystone_religious_gatherings_banned_ind*vcov(multivar_model2)[4,9] +
+    
+    2*demo_bridgedrace_p_blacks*hc_hospitals*vcov(multivar_model2)[5,6] +
+    2*demo_bridgedrace_p_blacks*hc_hospitals_per10000*vcov(multivar_model2)[5,7] +
+    2*demo_bridgedrace_p_blacks*demo_p65more*vcov(multivar_model2)[5,8] +
+    2*demo_bridgedrace_p_blacks*npi_keystone_religious_gatherings_banned_ind*vcov(multivar_model2)[5,9] +
+    
+    2*hc_hospitals*hc_hospitals_per10000*vcov(multivar_model2)[6,7] +
+    2*hc_hospitals*demo_p65more*vcov(multivar_model2)[6,8] +
+    2*hc_hospitals*npi_keystone_religious_gatherings_banned_ind*vcov(multivar_model2)[6,9] +
+    
+    2*hc_hospitals_per10000*demo_p65more*vcov(multivar_model2)[7,8] +
+    2*hc_hospitals_per10000*npi_keystone_religious_gatherings_banned_ind*vcov(multivar_model2)[7,9] +
+    
+    2*demo_p65more*npi_keystone_religious_gatherings_banned_ind*vcov(multivar_model2)[8,9]
+}
+
+point_est <- function(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind) {
+  exp(-4.500658 -0.007919*sv_pmobilehome -
+        0.014628*hc_pnotinsured_acs +
+        0.090823*como_asthma +
+        0.009693*demo_bridgedrace_p_blacks +
+        0.031120*hc_hospitals -
+        0.389661*hc_hospitals_per10000 +
+        0.044327*demo_p65more -
+        0.133252*npi_keystone_religious_gatherings_banned_ind)
+    }
+
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=100)
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  rename(`Asthma Pop. (%)` = como_asthma) -> plot_asthma
+
+plot_asthma %>%
+  ggplot(aes(x=`Asthma Pop. (%)`, y=cCFR))+
+  #geom_jitter(data = dat_training, aes(x=como_asthma,y=cCFR),color="gray", size=0.25)+
+  geom_line()+
+  geom_line(aes(x = `Asthma Pop. (%)`, y = lower), linetype = 2) + 
+  geom_line(aes(x = `Asthma Pop. (%)`, y = upper), linetype = 2) +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none")
+```
+
+```{r coeff_p65more, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=100)
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  rename(`Pop. >=65 yrs (%)` = demo_p65more) -> plot_p65more
+
+plot_p65more %>%
+  ggplot(aes(x=`Pop. >=65 yrs (%)`, y=cCFR))+
+  #geom_jitter(data = dat_training, aes(x=demo_p65more,y=cCFR),color="gray", size=0.25)+
+  geom_line()+
+  geom_line(aes(x = `Pop. >=65 yrs (%)`, y = lower), linetype = 2) + 
+  geom_line(aes(x = `Pop. >=65 yrs (%)`, y = upper), linetype = 2) +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none")
+```
+
+```{r coeff_p_blacks, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=100)
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  rename(`Black Pop. (%)` = demo_bridgedrace_p_blacks) -> plot_p_blacks
+
+plot_p_blacks %>%
+  ggplot(aes(x=`Black Pop. (%)`, y=cCFR))+
+  #geom_jitter(data = dat_training, aes(x=demo_bridgedrace_p_blacks, y=cCFR), color="gray", size=0.25)+
+  geom_line()+
+  geom_line(aes(x = `Black Pop. (%)`, y = lower), linetype = 2) + 
+  geom_line(aes(x = `Black Pop. (%)`, y = upper), linetype = 2) +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none")
+```
+
+```{r coeff_pnotinsured, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=100)
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  rename(`Not Insured ACS (%)` = hc_pnotinsured_acs) -> plot_pnotinsured
+
+plot_pnotinsured %>%
+  ggplot(aes(x=`Not Insured ACS (%)`, y=cCFR))+
+  #geom_jitter(data = dat_training, aes(x=hc_pnotinsured_acs, y=cCFR), color="gray", size=0.25)+
+  geom_line()+
+  geom_line(aes(x = `Not Insured ACS (%)`, y = lower), linetype = 2) + 
+  geom_line(aes(x = `Not Insured ACS (%)`, y = upper), linetype = 2) +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none")
+```
+
+```{r coeff_pmobilehome, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=100)
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  rename(`Mobile Home Pop. (%)` = sv_pmobilehome) -> plot_pmobilehome
+
+plot_pmobilehome %>%
+  ggplot(aes(x=`Mobile Home Pop. (%)`, y=cCFR))+
+  #geom_jitter(data = dat_training, aes(x=sv_pmobilehome, y=cCFR), color="gray", size=0.25)+
+  geom_line()+
+  geom_line(aes(x = `Mobile Home Pop. (%)`, y = lower), linetype = 2) + 
+  geom_line(aes(x = `Mobile Home Pop. (%)`, y = upper), linetype = 2) +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none")
+```
+
+```{r coeff_hospitals, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=100)
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  rename(`Hospitals Total` = hc_hospitals) -> plot_hospitals
+
+plot_hospitals %>%
+  ggplot(aes(x=`Hospitals Total`, y=cCFR))+
+  #geom_jitter(data = dat_training, aes(x=hc_hospitals, y=cCFR), color="gray", size=0.25)+
+  geom_line()+
+  geom_line(aes(x = `Hospitals Total`, y = lower), linetype = 2) + 
+  geom_line(aes(x = `Hospitals Total`, y = upper), linetype = 2) +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none")
+```
+
+```{r coeff_hospitals10000, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=100)
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  rename(`Hospitals per 10,000` = hc_hospitals_per10000) -> plot_hospitals10000
+
+plot_hospitals10000 %>%
+  ggplot(aes(x=`Hospitals per 10,000`, y=cCFR))+
+  #geom_jitter(data = dat_training, aes(x=hc_hospitals_per10000, y=cCFR), color="gray", size=0.25)+
+  geom_line()+
+  geom_line(aes(x = `Hospitals per 10,000`, y = lower), linetype = 2) + 
+  geom_line(aes(x = `Hospitals per 10,000`, y = upper), linetype = 2) +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none")
+```
+
+### Two variable comparisons
+
+For these graphs, we vary one variable of interest within the range of values we observe in our data, take the 0, 25, 50, 75, 100 quantiles for the second variable (only 0, 50, 100 if CIs included), and use the median for all other variables.
+
+#### Mobile Home Pop. (%) Quantiles
+
+```{r plot_mobile, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+  sv_pmobilehome=quantile(dat_clean$sv_pmobilehome)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> a
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+  sv_pmobilehome=quantile(dat_clean$sv_pmobilehome)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> b
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+  sv_pmobilehome=quantile(dat_clean$sv_pmobilehome)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> c
+
+expand.grid(
+  hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+  sv_pmobilehome=quantile(dat_clean$sv_pmobilehome)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> d
+
+expand.grid(
+  hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+  sv_pmobilehome=quantile(dat_clean$sv_pmobilehome)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> e
+
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+  sv_pmobilehome=quantile(dat_clean$sv_pmobilehome)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(sv_pmobilehome = as.factor(round(sv_pmobilehome,2))) %>%
+  rename(`Mobile Home Pop. (%)` = sv_pmobilehome) %>%
+  ggplot()+
+    geom_line(aes(x=value, y=cCFR, group=`Mobile Home Pop. (%)`, color=`Mobile Home Pop. (%)`)) +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Mobile Home Pop. (%) Quantiles (0, 25, 50, 75, 100)")
+```
+
+```{r plot_mobile2, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+    sv_pmobilehome=quantile(dat_clean$sv_pmobilehome, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> a
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+  sv_pmobilehome=quantile(dat_clean$sv_pmobilehome, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> b
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+  sv_pmobilehome=quantile(dat_clean$sv_pmobilehome, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> c
+
+expand.grid(
+    hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+    sv_pmobilehome=quantile(dat_clean$sv_pmobilehome, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> d
+
+expand.grid(
+    hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+    sv_pmobilehome=quantile(dat_clean$sv_pmobilehome, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> e
+  
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+  sv_pmobilehome=quantile(dat_clean$sv_pmobilehome, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(sv_pmobilehome = as.factor(round(sv_pmobilehome,2))) %>%
+  rename(`Mobile Home Pop. (%)` = sv_pmobilehome) %>%
+  ggplot(aes(x=value, y=cCFR, group=`Mobile Home Pop. (%)`, color=`Mobile Home Pop. (%)`,fill=`Mobile Home Pop. (%)`))+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha=.15, linetype=2) +
+    geom_line() +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Mobile Home Pop. (%) Quantiles (0, 50, 100)")
+```
+
+#### Hospitals Total Quantiles
+
+```{r plot_hospitalst, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+  sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+  hc_hospitals=quantile(dat_clean$hc_hospitals)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+  hc_hospitals=quantile(dat_clean$hc_hospitals)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> b
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+  hc_hospitals=quantile(dat_clean$hc_hospitals)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> c
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+  hc_hospitals=quantile(dat_clean$hc_hospitals)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> d
+
+expand.grid(
+  hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+  hc_hospitals=quantile(dat_clean$hc_hospitals)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> e
+
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+  hc_hospitals=quantile(dat_clean$hc_hospitals)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(hc_hospitals = as.factor(round(hc_hospitals,2))) %>%
+  rename(`Hospitals Total` = hc_hospitals) %>%
+  ggplot()+
+    geom_line(aes(x=value, y=cCFR, group=`Hospitals Total`, color=`Hospitals Total`)) +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Hospitals Total Quantiles (0, 25, 50, 75, 100)")
+```
+
+```{r plot_hospitalst2, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+    hc_hospitals=quantile(dat_clean$hc_hospitals, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+    hc_hospitals=quantile(dat_clean$hc_hospitals, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> b
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+    hc_hospitals=quantile(dat_clean$hc_hospitals, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> c
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+    hc_hospitals=quantile(dat_clean$hc_hospitals, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> d
+
+expand.grid(
+    hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+    hc_hospitals=quantile(dat_clean$hc_hospitals, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> e
+  
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+    hc_hospitals=quantile(dat_clean$hc_hospitals, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(hc_hospitals = as.factor(round(hc_hospitals,2))) %>%
+  rename(`Hospitals Total` = hc_hospitals) %>%
+  ggplot(aes(x=value, y=cCFR, group=`Hospitals Total`, color=`Hospitals Total`, fill=`Hospitals Total`))+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha=.15, linetype=2) +
+    geom_line() +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Hospitals Total Quantiles (0, 50, 100)")
+```
+
+#### Hospitals per 10,000 Quantiles
+
+```{r plot_hospitals, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+  sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+  hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+  hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> b
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+  hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> c
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+  hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> d
+
+expand.grid(
+  hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+  hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> e
+
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+  hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(hc_hospitals_per10000 = as.factor(round(hc_hospitals_per10000,2))) %>%
+  rename(`Hospitals per 10,000` = hc_hospitals_per10000) %>%
+  ggplot()+
+    geom_line(aes(x=value, y=cCFR, group=`Hospitals per 10,000`, color=`Hospitals per 10,000`)) +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Hospitals per 10,000 Quantiles (0, 25, 50, 75, 100)")
+```
+
+```{r plot_hospitals2, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+    hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+    hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> b
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+    hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> c
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+    hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> d
+
+expand.grid(
+  hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+    hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> e
+  
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+    hc_hospitals_per10000=quantile(dat_clean$hc_hospitals_per10000, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(hc_hospitals_per10000 = as.factor(round(hc_hospitals_per10000,2))) %>%
+  rename(`Hospitals per 10,000` = hc_hospitals_per10000) %>%
+  ggplot(aes(x=value, y=cCFR, group=`Hospitals per 10,000`, color=`Hospitals per 10,000`, fill=`Hospitals per 10,000`))+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha=.15, linetype=2) +
+    geom_line() +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Hospitals per 10,000 Quantiles (0, 50, 100)")
+```
+
+#### Asthma Pop. (%) Quantiles
+
+```{r plot_asthma, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+  sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+  como_asthma=quantile(dat_clean$como_asthma)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+  como_asthma=quantile(dat_clean$como_asthma)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> b
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+  como_asthma=quantile(dat_clean$como_asthma)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> c
+
+expand.grid(
+  hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+  como_asthma=quantile(dat_clean$como_asthma)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> d
+
+expand.grid(
+  hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+  como_asthma=quantile(dat_clean$como_asthma)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> e
+
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+  como_asthma=quantile(dat_clean$como_asthma)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(como_asthma = as.factor(round(como_asthma,2))) %>%
+  rename(`Asthma Pop. (%)` = como_asthma) %>%
+  ggplot()+
+    geom_line(aes(x=value, y=cCFR, group=`Asthma Pop. (%)`, color=`Asthma Pop. (%)`)) +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Asthma Pop. (%) Quantiles (0, 25, 50, 75, 100)")
+```
+
+```{r plot_asthma2, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+  como_asthma=quantile(dat_clean$como_asthma, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+  como_asthma=quantile(dat_clean$como_asthma, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> b
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+  como_asthma=quantile(dat_clean$como_asthma, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> c
+
+expand.grid(
+    hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+  como_asthma=quantile(dat_clean$como_asthma, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> d
+
+expand.grid(
+    hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+  como_asthma=quantile(dat_clean$como_asthma, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> e
+  
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+  como_asthma=quantile(dat_clean$como_asthma, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(como_asthma = as.factor(round(como_asthma,2))) %>%
+  rename(`Asthma Pop. (%)` = como_asthma) %>%
+  ggplot(aes(x=value, y=cCFR, group=`Asthma Pop. (%)`, color=`Asthma Pop. (%)`, fill=`Asthma Pop. (%)`))+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha=.15, linetype=2) +
+    geom_line() +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Asthma Pop. (%) Quantiles (0, 50, 100)")
+```
+
+#### Black Pop. (%) Quantiles
+
+```{r plot_pblack, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+  sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> b
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> c
+
+expand.grid(
+  hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> d
+
+expand.grid(
+  hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> e
+
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(demo_bridgedrace_p_blacks = as.factor(round(demo_bridgedrace_p_blacks,2))) %>%
+  rename(`Black Pop. (%)` = demo_bridgedrace_p_blacks) %>%
+  ggplot()+
+    geom_line(aes(x=value, y=cCFR, group=`Black Pop. (%)`, color=`Black Pop. (%)`)) +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Black Pop. (%) Quantiles (0, 25, 50, 75, 100)")
+```
+
+```{r plot_pblack2, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> b
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> c
+
+expand.grid(
+    hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> d
+
+expand.grid(
+    hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> e
+  
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+  demo_bridgedrace_p_blacks=quantile(dat_clean$demo_bridgedrace_p_blacks, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(demo_bridgedrace_p_blacks = as.factor(round(demo_bridgedrace_p_blacks,2))) %>%
+  rename(`Black Pop. (%)` = demo_bridgedrace_p_blacks) %>%
+  ggplot(aes(x=value, y=cCFR, group=`Black Pop. (%)`, color=`Black Pop. (%)`, fill=`Black Pop. (%)`))+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha=.15, linetype=2) +
+    geom_line() +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Black Pop. (%) Quantiles (0, 50, 100)")
+```
+
+#### Pop. >=65 yrs (%) Quantiles
+
+```{r plot_p65more, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+  sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+  demo_p65more=quantile(dat_clean$demo_p65more)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+  demo_p65more=quantile(dat_clean$demo_p65more)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> b
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+  demo_p65more=quantile(dat_clean$demo_p65more)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> c
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+  demo_p65more=quantile(dat_clean$demo_p65more)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> d
+
+expand.grid(
+  hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+  demo_p65more=quantile(dat_clean$demo_p65more)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> e
+
+expand.grid(
+  hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+  demo_p65more=quantile(dat_clean$demo_p65more)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(demo_p65more = as.factor(round(demo_p65more,2))) %>%
+  rename(`Pop. >=65 yrs (%)` = demo_p65more) %>%
+  ggplot()+
+    geom_line(aes(x=value, y=cCFR, group=`Pop. >=65 yrs (%)`, color=`Pop. >=65 yrs (%)`)) +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Pop. >=65 yrs (%) Quantiles (0, 25, 50, 75, 100)")
+```
+
+```{r plot_p65more2, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+    demo_p65more=quantile(dat_clean$demo_p65more, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  hc_pnotinsured_acs=seq(min(dat_clean$hc_pnotinsured_acs),max(dat_clean$hc_pnotinsured_acs),length=20),
+    demo_p65more=quantile(dat_clean$demo_p65more, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Not Insured ACS (%)") %>%
+  rename(value = hc_pnotinsured_acs) -> b
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+    demo_p65more=quantile(dat_clean$demo_p65more, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> c
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+    demo_p65more=quantile(dat_clean$demo_p65more, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> d
+
+expand.grid(
+    hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+    demo_p65more=quantile(dat_clean$demo_p65more, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> e
+
+expand.grid(
+    hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+    demo_p65more=quantile(dat_clean$demo_p65more, probs=c(0,0.5,1))
+  ) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(demo_p65more = as.factor(round(demo_p65more,2))) %>%
+  rename(`Pop. >=65 yrs (%)` = demo_p65more) %>%
+  ggplot(aes(x=value, y=cCFR, group=`Pop. >=65 yrs (%)`, color=`Pop. >=65 yrs (%)`, fill=`Pop. >=65 yrs (%)`))+
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha=.15, linetype=2) +
+    geom_line() +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Pop. >=65 yrs (%) Quantiles (0, 50, 100)")
+```
+
+#### Not Insured ACS (%) Quantiles
+
+```{r plot_heartdiz, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+  sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> b
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> c
+
+expand.grid(
+  hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> d
+
+expand.grid(
+  hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> e
+
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs)
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(hc_pnotinsured_acs = as.factor(round(hc_pnotinsured_acs,2))) %>%
+  rename(`Not Insured ACS (%)` = hc_pnotinsured_acs) %>%
+  ggplot()+
+    geom_line(aes(x=value, y=cCFR, group=`Not Insured ACS (%)`, color=`Not Insured ACS (%)`)) +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Not Insured ACS (%) Quantiles (0, 25, 50, 75, 100)")
+```
+
+```{r plot_heartdiz2, echo=FALSE}
+sv_pmobilehome <- median(dat_clean$sv_pmobilehome)
+hc_pnotinsured_acs <- median(dat_clean$hc_pnotinsured_acs)
+como_asthma <- median(dat_clean$como_asthma)
+demo_bridgedrace_p_blacks <- median(dat_clean$demo_bridgedrace_p_blacks)
+hc_hospitals <- median(dat_clean$hc_hospitals)
+hc_hospitals_per10000 <- median(dat_clean$hc_hospitals_per10000)
+demo_p65more <- median(dat_clean$demo_p65more)
+npi_keystone_religious_gatherings_banned_ind <- 0
+
+expand.grid(
+    sv_pmobilehome=seq(min(dat_clean$sv_pmobilehome),max(dat_clean$sv_pmobilehome),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Mobile Home Pop. (%)") %>%
+  rename(value = sv_pmobilehome) -> a
+
+expand.grid(
+  como_asthma=seq(min(dat_clean$como_asthma),max(dat_clean$como_asthma),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Asthma Pop. (%)") %>%
+  rename(value = como_asthma) -> b
+
+expand.grid(
+  demo_bridgedrace_p_blacks=seq(min(dat_clean$demo_bridgedrace_p_blacks),max(dat_clean$demo_bridgedrace_p_blacks),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Black Pop. (%)") %>%
+  rename(value = demo_bridgedrace_p_blacks) -> c
+
+expand.grid(
+    hc_hospitals=seq(min(dat_clean$hc_hospitals),max(dat_clean$hc_hospitals),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals Total") %>%
+  rename(value = hc_hospitals) -> d
+
+expand.grid(
+    hc_hospitals_per10000=seq(min(dat_clean$hc_hospitals_per10000),max(dat_clean$hc_hospitals_per10000),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Hospitals per 10,000") %>%
+  rename(value = hc_hospitals_per10000) -> e
+  
+expand.grid(
+  demo_p65more=seq(min(dat_clean$demo_p65more),max(dat_clean$demo_p65more),length=20),
+  hc_pnotinsured_acs=quantile(dat_clean$hc_pnotinsured_acs, probs=c(0,0.5,1))
+) %>%
+  mutate(cCFR = point_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(var = var_est(sv_pmobilehome, hc_pnotinsured_acs, como_asthma, demo_bridgedrace_p_blacks, hc_hospitals, hc_hospitals_per10000, demo_p65more, npi_keystone_religious_gatherings_banned_ind)) %>%
+  mutate(lower = exp(log(cCFR)-1.96*sqrt(var)),
+         upper = exp(log(cCFR)+1.96*sqrt(var))) %>%
+  mutate(type = "Pop. >=65 yrs (%)") %>%
+  rename(value = demo_p65more) -> f
+
+rbind(a,b,c,d,e,f)->g
+
+g %>%
+  mutate(hc_pnotinsured_acs = as.factor(round(hc_pnotinsured_acs,2))) %>%
+  rename(`Not Insured ACS (%)` = hc_pnotinsured_acs) %>%
+  ggplot(aes(x=value, y=cCFR, group=`Not Insured ACS (%)`, color=`Not Insured ACS (%)`, fill=`Not Insured ACS (%)`)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha=.15, linetype=2) +
+    geom_line() +
+  facet_wrap(~type, scales = "free") +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank()) +
+  ggtitle("Not Insured ACS (%) Quantiles (0, 25, 50, 75, 100)")
+```
+
+# Extra stuff
+
+## Collinearity
+
+One of the first things we should check at this stage is if there are issues of collinearity in our present model. In this study, we will check to see if all variance inflation factors are below 10. Our VIFs are very low, all below 2. Collinearity is not an issue with our variables.
+
+```{r vif}
+cbind(depVarList,as.data.frame(unname(vif(multivar_model2), force = FALSE))) -> vif_table
+colnames(vif_table)[1] <- "Variable"
+colnames(vif_table)[2] <- "VIF"
+
+kableExtra::kable(vif_table,caption="Multivariable Model", booktabs = T, align = c("l","r")) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+## Covariance matrix
+
+```{r cov}
+format2 <- function(x, na.rm = FALSE) formatC(x, digits = 2, format = "e")
+
+cbind(c("Intercept",depVarList),as.data.frame(unname(vcov(multivar_model2), force = FALSE))) %>%
+  mutate(dplyr::across(where(is.numeric), format2)) -> cov_table
+colnames(cov_table)[1] <- "Variable"
+
+kableExtra::kable(cov_table,caption="Covariance Matrix", col.names = c("Variable","(Intercept)","sv_pmobilehome","hc_pnotinsured_acs","como_asthma","demo_bridgedrace_p_blacks","hc_hospitals","hc_hospitals_per10000","demo_p65more","religious_gatherings_ban"), booktabs = T, align = c("l","r","r","r","r","r","r","r","r","r","r")) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+```
+
+## Compare fits for training/testing data
+
+### Visual
+
+```{r testing_dat, warning=FALSE}
+as.data.frame(cbind(model = fitted(multivar_model2),
+                    orig = dat_training$total_deaths)) %>%
+  mutate(type = "Training Data") -> dat_fit
+
+as.data.frame(cbind(model = exp(predict(multivar_model2,newdata=dat_testing)),
+                    orig = dat_testing$total_deaths)) %>%
+  mutate(type = "Testing Data") -> dat_pred
+
+rbind(dat_fit,dat_pred) -> dat_plot
+
+dat_plot %>%
+  ggplot() +
+  geom_point(aes(x=orig,y=model),size=0.5) +
+  scale_x_continuous(trans='log10') +
+  scale_y_continuous(trans='log10') +
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap(~type) +
+  geom_smooth(aes(x=orig,y=model)) +
+    theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none") +
+  ylab("Model Outcomes") + xlab("Original Data (Total Deaths)")
+```
+
+### Accuracy
+
+Similar to ROC, a gain curve plot measures how well the model score sorts the data compared to the true outcome value. When the predictions sort in exactly the same order, the relative Gini coefficient is 1. When the model sorts poorly, the relative Gini coefficient is close to zero, or even negative. Ours are high (training data= 0.9840, testing data= 0.9829).
+
+```{r gini, warning=FALSE}
+#"NormalizedGini" is the other half of the metric. This function does most of the work, though
+SumModelGini <- function(solution, submission) {
+  df = data.frame(solution = solution, submission = submission)
+  df <- df[order(df$submission, decreasing = TRUE),]
+  df
+  df$random = (1:nrow(df))/nrow(df)
+  df
+  totalPos <- sum(df$solution)
+  df$cumPosFound <- cumsum(df$solution) # this will store the cumulative number of positive examples found (used for computing "Model Lorentz")
+  df$Lorentz <- df$cumPosFound / totalPos # this will store the cumulative proportion of positive examples found ("Model Lorentz")
+  df$Gini <- df$Lorentz - df$random # will store Lorentz minus random
+  #print(df)
+  return(sum(df$Gini))
+}
+
+NormalizedGini <- function(solution, submission) {
+  SumModelGini(solution, submission) / SumModelGini(solution, solution)
+}
+
+NormalizedGini(dat_fit$orig, dat_fit$model) -> gini_train
+NormalizedGini(dat_pred$orig, dat_pred$model) -> gini_test
+
+library(WVPlots)
+gini_train
+GainCurvePlot(dat_fit, "model", "orig", "Total Deaths", estimate_sig=TRUE)
+gini_test
+GainCurvePlot(dat_pred, "model", "orig", "Total Deaths", estimate_sig=TRUE)
+```
+
+Diebold-Mariano test to see if prediction errors are significantly different. The prediction errors are not significantly different between the training and testing datasets.
+
+```{r rmse, warning=FALSE}
+#RMSE
+rmse = function(y, ypred) {
+rmse = sqrt(mean((y - ypred)^2))
+return(rmse)
+}
+
+rmse(dat_fit$orig, dat_fit$model)
+rmse(dat_pred$orig, dat_pred$model)
+
+library(forecast)
+dm.test((dat_fit$orig - dat_fit$model),(dat_pred$orig - dat_pred$model),h=1)
+```
+
+### Coverage
+
+The coverage is the probability that our model outcomes are found within our prediction interval. To estimate our predictive coverage (empirical coverage), we simulate a prediction interval. Our coverage is 0.9722 for the training data, 0.9713 for testing data.
+
+```{r pred_interval, warning=FALSE}
+library(arm)
+
+coverage = function(y, pi) {
+mean(y >= pi[,1] & y <= pi[,2])
+}
+
+pi.nb = function(object, newdata, level=.95, nsim=10000) {
+set.seed(126943L)
+  require(mvtnorm)
+n = nrow(newdata)
+X = model.matrix(object, data=newdata)
+#beta = rmvnorm(nsim, coef(object), vcov(object)) # use GLM to generate beta's
+beta = sim(object, nsim)
+theta = rnorm(nsim, multivar_model2$theta, multivar_model2$SE.theta)
+y.rep = array(NA, c(nsim, n))
+for (i in 1:nsim) {
+  #y.hat <- newdata$adj_total_cases * exp(X %*% beta[i,])
+  y.hat <- newdata$adj_total_cases * exp(X %*% beta@coef[i,])
+  y.rep[i,] <- rnegbin(n, mu=y.hat, theta=theta[i])
+}
+pi = t(apply(y.rep, 2, function(x) {
+quantile(x, c((1 - level)/2,
+.5 + level/2))}))
+return(pi)
+}
+
+covid.train = dat_training
+covid.test = dat_testing
+covid.train.NB = glm(formula = as.formula(formula),
+           family  = negative.binomial(theta = multivar_model2$theta, link = "log"),
+           data    = covid.train)
+pi = pi.nb(covid.train.NB, covid.test)
+coverage(covid.test$total_deaths, pi)
+
+data.frame(total_deaths = covid.test$total_deaths,
+pred = predict(covid.train.NB, # training model
+covid.test, # test data
+type="response"), # type of prediction = exp(X beta)
+lwr = pi[,1], upr=pi[,2]) %>% arrange(pred) %>%
+  mutate(type = "Testing Data") ->df_test
+
+pi = pi.nb(covid.train.NB, covid.train)
+coverage(covid.train$total_deaths, pi)
+
+data.frame(total_deaths = covid.train$total_deaths,
+pred = predict(covid.train.NB, # training model
+covid.train, # test data
+type="response"), # type of prediction = exp(X beta)
+lwr = pi[,1], upr=pi[,2]) %>% arrange(pred) %>%
+  mutate(type = "Training Data") ->df_train
+
+rbind(df_train,df_test) -> df
+
+ggplot(df, aes(x=pred, y=total_deaths)) +
+geom_ribbon(aes(ymin = lwr, ymax = upr),
+fill = "blue", alpha = 0.2) +
+  facet_wrap(~type) +
+geom_point(aes(y=total_deaths), size=0.5) +
+    theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none") +
+  scale_y_continuous(trans = "log10") +
+  scale_x_continuous(trans = "log10") +
+  geom_abline(intercept = 0, slope = 1) +
+  xlab("Model Outcomes") + ylab("Original Data (Total Deaths)") +
+ggtitle("95% Prediction Intervals under N.B. Model")
+```
+
+## Half-normal plot of residuals
+
+This can detect outliers and indicate whether the error distribution was specified appropriately. A simulated envelope to the half-normal plot serves as a guide of what to expect under a well-fitted model [Moral et al., 2017](https://www.jstatsoft.org/article/view/2340).
+
+```{r half_norm}
+getHalfNormQuant <- function(resids){
+  n  <- length(resids)
+  qu <- rep(NA, n)
+  for(i in 1:n){
+    qu[i] <- sum(resids < resids[i])/n
+  }
+  qh <- fdrtool::qhalfnorm(p = qu)
+  return(qh)
+}
+
+getNegBinEnvelope <- function(model.object, model.data, res.type = "deviance"){
+  y.var <- as.character(formula(model.object))[2]
+  model <- formula(model.object)
+  resid.matrix <- matrix(ncol = 19, nrow = nrow(model.data))
+  for(i in 1:19){
+    model.data[, y.var] <- rnegbin(nrow(model.data), mu = fitted(model.object), theta = model.object$theta)
+    model.refit <- glm.nb(model, data = model.data)
+    resid.matrix[, i] <- sort(abs(residuals(model.refit, res.type)))
+  }
+  envelope.df <- data.frame(
+    min = apply(resid.matrix, 1, FUN = min),
+    max = apply(resid.matrix, 1, FUN = max),
+    mean = apply(resid.matrix, 1, FUN = mean)
+  )
+  envelope.df <- gather(envelope.df, 
+                        key = part,
+                        value = resid)
+  envelope.df$qhn <- NA
+  for(j in unique(envelope.df$part)){
+    envelope.df[envelope.df$part == j, "qhn"] <- getHalfNormQuant(envelope.df[envelope.df$part == j, "resid"])
+  }
+  return(envelope.df)
+}
+
+negbin.envelope <- getNegBinEnvelope(multivar_model2, dat_training)
+negbin.resids <- data.frame(resid = sort(abs(residuals(multivar_model2))), qhn = getHalfNormQuant(sort(abs(residuals(multivar_model2)))))
+
+ggplot(data = negbin.envelope, aes(x = qhn, y = resid, group = part)) +
+  geom_line(lty = 2, col = "red", data = subset(negbin.envelope, part == "mean")) +
+  geom_line(data = subset(negbin.envelope, part != "mean")) +
+  geom_point(data = negbin.resids, aes(group = NULL),size=0.5) +
+  theme_bw() +
+  labs(x = "Half-normal quantiles",
+       y = "Absolute ordered deviance residuals",
+       title = "Negative binomial model")
+```
+
+## Mean-variance relationship
+
+A quick check that our model captures the varience of our data well is to group the fitted predictions into quantiles, calculate the means and variances, and plot them. Loess smooth is used for the emperical mean. [Discrete Data Analysis with R](http://ddar.datavis.ca/pages/home)
+
+```{r var_plot}
+cutq <- function(x, q = 10) {
+  quantile <- cut(x, breaks = quantile(x, probs = (0 : q) / q),
+                  include.lowest = TRUE, labels = 1 : q)
+  quantile
+}
+
+
+fit.nbin <- stats::fitted(multivar_model2, type = "response")
+
+group <- cutq(fit.nbin, q = 20)
+qdat <- aggregate(dat_training$total_deaths,
+                  list(group),
+                  FUN = function(x) c(mean = mean(x), var = var(x)))
+qdat <- data.frame(qdat$x)
+qdat <- qdat[order(qdat$mean),]
+qdat$nbvar <- qdat$mean + (qdat$mean^2) / multivar_model2$theta
+
+qdat %>%
+  ggplot() +
+  geom_point(aes(x=mean,y=var), color="black") +
+  geom_smooth(aes(x=mean,y=var), method = "loess", size=0.5) +
+  geom_smooth(aes(x=mean,y=nbvar), method = "loess", lty = "dashed", color="black", size=0.5) +
+  geom_smooth(aes(x=mean,y=mean), method = "loess", lty = "solid", color="black", size=0.5) +
+    theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(), 
+                     legend.position = "none") +
+  scale_y_continuous(trans = "log10") +
+  scale_x_continuous(trans = "log10") +
+  ylab("Variance") + xlab("Mean") +
+  annotate(geom="text", x=40, y=5, label="Poisson variance (black, solid line)",color="black",size=2.5) +
+  annotate(geom="text", x=25, y=30000, label="N.B. variance (black, dashed line)",color="black",size=2.5) +
+  annotate(geom="text", x=1.5, y=200, label="Loess smooth of data variance (blue, solid line)",color="black",size=2.5)
+```
+
+## Correlation
+
+```{r corr_plot,fig.height=7,warning=FALSE}
+library(ggcorrplot)
+
+# Compute a correlation matrix
+corr <- round(cor(depend_vars_no_miss[-1]), 1)
+
+depend_vars_no_miss %>%
+  dplyr::select(sv_pmobilehome,hc_pnotinsured_acs,como_asthma,demo_bridgedrace_p_blacks,hc_hospitals,hc_hospitals_per10000,demo_p65more,npi_keystone_religious_gatherings_banned_ind) -> depend_vars_no_miss2
+corr2 <- round(cor(depend_vars_no_miss2), 1)
+
+ggcorrplot(corr, p.mat = cor_pmat(depend_vars_no_miss[-1]), hc.order = TRUE, outline.col = "white", tl.cex = 6, pch.cex = 1.5)
+
+ggcorrplot(corr2, p.mat = cor_pmat(depend_vars_no_miss2), hc.order = TRUE, outline.col = "white")
+
+as.matrix(cor(depend_vars_no_miss[-1])) -> Data_cor
+arrange(reshape2::melt(Data_cor), -abs(value)) -> Data_cor_melt
+Data_cor_melt %>% filter(value<1)
+```
+
+## $R^2$, Overdispersion
+
+```{r etc,warning=FALSE}
+# Check for excess overdispersion
+
+resid.ssq <- sum(residuals(multivar_model2,type="pearson")^2)  ## sum of squares of Pearson resids
+resid.df <- nrow(dat_training)-length(coef(multivar_model2))   ## estimated resid df (N-p)
+resid.ssq/resid.df ## ratio should be approx 1
+
+
+#Pseudo R2, Cox and Snell
+
+library(rsq)
+rsq(multivar_model2, type="lr")
+```
+
