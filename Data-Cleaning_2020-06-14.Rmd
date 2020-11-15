@@ -1,0 +1,748 @@
+---
+title: "Data Cleaning for Project 7"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(rmarkdown)
+```
+
+# 1. LOAD PACKAGES NEEDED
+
+``` {r, message=FALSE}
+library(tidyverse)
+library(magrittr)
+library(sf)
+library(stringr)
+library(tidycensus)
+library(tigris)
+library(albersusa)
+library(measurements)
+library(googlesheets4)
+library(haven)
+library(readxl)
+library(googledrive)
+```
+
+# 2. IMPORT US CENSUS DATA
+
+## 2.1 US Census TIGER files
+
+We will import US Census TIGER files using package 'tigris'.
+
+County
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+county_TIGER <- tigris::counties(cb = TRUE, year = 2018, class = "sf", resolution = '5m') %>%
+  dplyr::select(GEOID, STATEFP, ALAND, geometry, NAME) %>%
+  dplyr::rename(county.name = NAME) %>%
+  dplyr::mutate(ALANDKM2 = ALAND/1000000,
+                ALANDMI2 = ALAND*3.8610215854781257*10^(-7),
+                FIPS = as.numeric(GEOID)) %>%
+  dplyr::select(GEOID, FIPS, county.name, STATEFP, ALAND, ALANDKM2, ALANDMI2, geometry)
+```
+
+State: We only need the state name from this dataset.
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+state_TIGER <- tigris::states(cb = TRUE, year = 2018, class = "sf", resolution = '5m') %>%
+dplyr::select(STATEFP,NAME) %>%
+dplyr::rename(state.name=NAME) %>%
+sf::st_set_geometry(NULL)
+```
+
+We merged these two files for final spatial data.
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- county_TIGER %>%
+  dplyr::left_join(state_TIGER, by ="STATEFP") %>%
+  dplyr::mutate(state.fips.num = as.numeric(STATEFP)) %>%
+  dplyr::rename(state.fips = STATEFP) %>%
+  dplyr::select(GEOID, FIPS, county.name, state.fips, state.fips.num, state.name, ALAND, ALANDKM2, ALANDMI2, geometry)
+```
+
+
+## 2.2 US Census American Community Survey files
+
+We will import the US Census ACS files using package 'tidycensus'. 
+
+At first, you will need to obtain a census api key at https://api.census.gov/data/key_signup.html. After that, you now register this api key into the system.
+
+
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+tidycensus::census_api_key("YOURCENSUSAPIKEY", overwrite = TRUE, install = TRUE)
+```
+```{r, include = FALSE}
+tidycensus::census_api_key("2f6391f67689e90c017b3034da9580cc7801070f", overwrite = TRUE, install = TRUE)
+```
+
+
+You can identify the variables you need. The data dictionary for ACS 2018 is available at https://api.census.gov/data/2018/acs/acs5/groups.html 
+
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+vars.list <- tidycensus::load_variables(2018, "acs5", cache = TRUE)
+```
+
+
+We identified and included the "concept" of the variables of interest
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+vars.list <- tidycensus::load_variables(2018, "acs5", cache = TRUE) %>%
+  dplyr::filter(concept %in% c(
+    "UNWEIGHTED SAMPLE COUNT OF THE POPULATION", #	B00001
+    "SEX BY AGE", # B01001
+    #"RACE", #B02001
+    #"HISPANIC OR LATINO ORIGIN BY SPECIFIC ORIGIN",
+    "HISPANIC OR LATINO ORIGIN BY RACE", #B03002	
+    "EDUCATIONAL ATTAINMENT FOR THE POPULATION 25 YEARS AND OVER", #B15003
+    "MEDIAN HOUSEHOLD INCOME IN THE PAST 12 MONTHS (IN 2018 INFLATION-ADJUSTED DOLLARS)", #B19013
+    #"POVERTY STATUS IN THE PAST 12 MONTHS BY AGE", 
+    "POVERTY STATUS IN THE PAST 12 MONTHS BY SEX BY AGE", #B17001
+    #"GINI INDEX OF INCOME INEQUALITY",
+    "HEALTH INSURANCE COVERAGE STATUS BY SEX BY AGE", #B27001
+    "HOUSEHOLD SIZE BY VEHICLES AVAILABLE", # B08201
+    "SEX BY AGE BY DISABILITY STATUS", #B18101
+    "UNITS IN STRUCTURE", #B25024
+    "TENURE BY OCCUPANTS PER ROOM", #B25014
+    "HOUSEHOLDS BY PRESENCE OF PEOPLE UNDER 18 YEARS BY HOUSEHOLD TYPE", #B11005
+    "EMPLOYMENT STATUS FOR THE POPULATION 16 YEARS AND OVER", #B23025
+    "GROUP QUARTERS POPULATION", #B26001
+    "NATIVITY BY LANGUAGE SPOKEN AT HOME BY ABILITY TO SPEAK ENGLISH FOR THE POPULATION 5 YEARS AND OVER", #B16005
+    "LANGUAGE SPOKEN AT HOME BY ABILITY TO SPEAK ENGLISH FOR THE POPULATION 5 YEARS AND OVER"
+  ))
+```
+
+
+We extracted ACS data below. This step might take 5-15 minutes to load the data depending on your internet widthband.
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+ACS_2018 <- tidycensus::get_acs(geography = "county", variables = vars.list$name, year = 2018, geometry = FALSE, tigris_use_cache = FALSE, keep_geo_vars = TRUE, cache = TRUE) 
+```
+
+# 3. CREATE FUNCTION FOR LATER USE
+
+Function to calculate percentage
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+ACS.extract <- function(groupcode){
+  test <- ACS_2018 %>%
+    dplyr::mutate(calculation = ifelse(variable %in% sumvariable,"sum",ifelse(variable %in% totalvariable,"total",""))) %>%
+    dplyr::filter(stringr::str_detect(variable, groupcode)) %>%
+    dplyr::group_by(GEOID,calculation) %>%
+    dplyr::summarize(estimate = sum(estimate)) %>%
+    dplyr::filter(calculation!="") %>%
+    tidyr::spread(key=calculation, value=estimate) %>%
+    dplyr::mutate(percentage=ifelse(total>0,sum/total*100,NA)) #%>%
+    #dplyr::mutate(percentage=sum/total*100) %>%
+    #dplyr::select(-2,-3)
+  data %<>% 
+    dplyr::full_join(test, by="GEOID") %>%
+    dplyr::select(-c("sum","total"))
+  data
+}
+```
+
+Function to download from googledrive file to the temp.file
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+ggdrive.download.temp.file <- function(id){
+  temp.file <- tempfile()
+  googledrive::drive_download(as_id(id), path = temp.file, overwrite=T)
+  temp.file
+}
+```
+
+Function to read files downloaded from NCCD
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+read.nccd <- function(id){
+  test <- readr::read_csv(ggdrive.download.temp.file(id)) %>%
+    dplyr::rename(GEOID = cnty_fips) %>%
+    dplyr::select(GEOID, Value) %>%
+    dplyr::filter(Value != -1)
+  test2 <- data %>% dplyr::full_join(test, by = "GEOID")
+  test2
+}
+```
+
+Function to read BRFSS data
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+read.brfss <- function(id){
+  test <- readr::read_csv(ggdrive.download.temp.file(id)) %>%
+    dplyr::filter(Response == "Yes") %>%
+    dplyr::rename(state.name = LocationDesc) %>%
+    dplyr::select(state.name, Data_Value)
+  test2 <- data %>% dplyr::full_join(test, by="state.name")
+  test2
+}
+```
+
+
+# 4. CLEAN AND CALCULATE COUNTY INDICATORS
+
+demo_population
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+test <- ACS_2018 %>%
+  dplyr::filter(variable=="B00001_001") %>%
+  dplyr::select(GEOID,estimate)
+data %<>% 
+  dplyr::full_join(test, by="GEOID") %>%
+  dplyr::rename(demo_population=estimate)
+```
+
+
+demo_landarea
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data %<>% dplyr::mutate(demo_landarea = ALANDKM2)
+```
+
+
+demo_popdensity
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data %<>% dplyr::mutate(demo_popdensity = demo_population/ALANDKM2)
+```
+
+
+demo_p65more
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B01001_020", "B01001_021", "B01001_022", "B01001_023", "B01001_024", "B01001_025",
+                 "B01001_044", "B01001_045", "B01001_046", "B01001_047", "B01001_048", "B01001_049")
+totalvariable <- c("B01001_001")
+data <- ACS.extract("B01001")
+data %<>% dplyr::rename(demo_p65more=percentage)
+```
+
+
+demo_65more
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B01001_020", "B01001_021", "B01001_022", "B01001_023", "B01001_024", "B01001_025",
+                 "B01001_044", "B01001_045", "B01001_046", "B01001_047", "B01001_048", "B01001_049")
+totalvariable <- c("B01001_001")
+test <- ACS_2018 %>%
+  dplyr::mutate(calculation = ifelse(variable %in% sumvariable,"sum",ifelse(variable %in% totalvariable,"total",""))) %>%
+  dplyr::filter(stringr::str_detect(variable, "B01001")) %>%
+  dplyr::group_by(GEOID,calculation) %>%
+  dplyr::summarize(estimate = sum(estimate)) %>%
+  dplyr::filter(calculation!="") %>%
+  tidyr::spread(key=calculation, value=estimate) %>%
+  dplyr::rename(demo_65more = sum) %>%
+  dplyr::select(GEOID, demo_65more)
+data %<>% dplyr::full_join(test, by="GEOID")
+```
+
+
+demo_p60more
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B01001_018", "B01001_019", "B01001_020", "B01001_021", "B01001_022", "B01001_023", "B01001_024", "B01001_025",
+                 "B01001_042", "B01001_043", "B01001_044", "B01001_045", "B01001_046", "B01001_047", "B01001_048", "B01001_049")
+totalvariable <- c("B01001_001")
+data <- ACS.extract("B01001")
+data %<>% dplyr::rename(demo_p60more=percentage)
+```
+
+
+demo_60more
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B01001_018", "B01001_019", "B01001_020", "B01001_021", "B01001_022", "B01001_023", "B01001_024", "B01001_025",
+                 "B01001_042", "B01001_043", "B01001_044", "B01001_045", "B01001_046", "B01001_047", "B01001_048", "B01001_049")
+totalvariable <- c("B01001_001")
+test <- ACS_2018 %>%
+  dplyr::mutate(calculation = ifelse(variable %in% sumvariable,"sum",ifelse(variable %in% totalvariable,"total",""))) %>%
+  dplyr::filter(stringr::str_detect(variable, "B01001")) %>%
+  dplyr::group_by(GEOID,calculation) %>%
+  dplyr::summarize(estimate = sum(estimate)) %>%
+  dplyr::filter(calculation!="") %>%
+  tidyr::spread(key=calculation, value=estimate) %>%
+  dplyr::rename(demo_60more = sum) %>%
+  dplyr::select(GEOID, demo_60more)
+data %<>% dplyr::full_join(test, by="GEOID")
+```
+
+
+ses_pnohighschool
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B15003_002", "B15003_003", "B15003_004", "B15003_005", "B15003_006", "B15003_007", "B15003_008", "B15003_009", "B15003_010", "B15003_011", "B15003_012", "B15003_013", "B15003_014", "B15003_015", "B15003_016")
+totalvariable <- c("B15003_001")
+data <- ACS.extract("B15003")
+data %<>% dplyr::rename(ses_pnohighschool=percentage)
+```
+
+
+ses_hhincome
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+test <- ACS_2018 %>%
+  dplyr::filter(variable=="B19013_001") %>%
+  dplyr::select(GEOID,estimate)
+data %<>% 
+  dplyr::full_join(test, by="GEOID") %>%
+  dplyr::rename(ses_hhincome=estimate)
+```
+
+
+ses_ppoverty
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B17001_002")
+totalvariable <- c("B17001_001")
+data <- ACS.extract("B17001")
+data %<>% dplyr::rename(ses_ppoverty=percentage)
+```
+
+
+ses_punemployed
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B23025_005")
+totalvariable <- c("B23025_001")
+data <- ACS.extract("B23025")
+data %<>% dplyr::rename(ses_punemployed=percentage)
+```
+
+
+ses_urcode_nchs
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+test2 <- data.frame(tibble(x = 1:6, y = c("Large central metro", "Large fringe metro", "Medium metro", "Small metro", "Micropolitan", "Noncore"))) %>%
+  dplyr::rename(ses_urcode_nchs = y)
+
+tempDir <- tempdir() # unzip to temp folder and temp file
+temp.file <- tempfile()
+download.file("https://www.cdc.gov/nchs/data/data_acces_files/NCHSURCodes2013.xlsx",temp.file,quiet=TRUE,mode="wb")
+test <- readxl::read_excel(temp.file) %>%
+  dplyr::rename(FIPS = 'FIPS code',
+                x = '2013 code') %>%
+  dplyr::left_join(test2,by="x") %>%
+  dplyr::select(FIPS, ses_urcode_nchs) %>%
+  dplyr::mutate(ses_urcode_nchs = as.factor(ses_urcode_nchs))
+data %<>% dplyr::full_join(test, by="FIPS")
+```
+
+
+sv_p17below
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B01001_003", "B01001_004", "B01001_005", "B01001_006",
+                 "B01001_027", "B01001_028", "B01001_029", "B01001_030")
+totalvariable <- c("B01001_001")
+data <- ACS.extract("B01001")
+data %<>% dplyr::rename(sv_p17below=percentage)
+```
+
+
+sv_pdisability
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B18101_007", "B18101_010", "B18101_013", "B18101_016", "B18101_019",
+                 "B18101_026", "B18101_029", "B18101_032", "B18101_035", "B18101_038")
+groupcode <- "B18101"
+test <- ACS_2018 %>%
+  dplyr::mutate(calculation = case_when(
+    variable %in% sumvariable ~ "sum",
+    variable == "B18101_001" ~ "B18101_001",
+    variable == "B18101_003" ~ "B18101_003",
+    variable == "B18101_022" ~ "B18101_022")) %>%
+  dplyr::filter(stringr::str_detect(variable, groupcode)) %>%
+  dplyr::group_by(GEOID,calculation) %>%
+  dplyr::summarize(estimate = sum(estimate)) %>%
+  dplyr::filter(calculation!="") %>%
+  tidyr::spread(key=calculation, value=estimate) %>%
+  dplyr::mutate(sv_pdisability = ifelse((B18101_001 - B18101_003 - B18101_022) > 0, sum / (B18101_001 - B18101_003 - B18101_022) * 100, NA)) %>%
+  dplyr::select(GEOID, sv_pdisability)
+data %<>% dplyr::full_join(test, by="GEOID")
+```
+
+
+sv_singleparent
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B11005_006", "B11005_007")
+totalvariable <- c("B11005_001")
+data <- ACS.extract("B11005")
+data %<>% dplyr::rename(sv_singleparent=percentage)
+```
+
+
+sv_pminority
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B03002_003")
+totalvariable <- c("B03002_001")
+data <- ACS.extract("B03002")
+data %<>% dplyr::mutate(sv_pminority=100-percentage) %>% dplyr::select(-c(percentage))
+```
+
+
+sv_penglish
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B16005_007", "B16005_008", "B16005_012", "B16005_013", "B16005_017", "B16005_018", "B16005_022", "B16005_023", "B16005_029", 
+                 "B16005_030", "B16005_034", "B16005_035", "B16005_039", "B16005_040", "B16005_044", "B16005_045")
+totalvariable <- c("B16005_001")
+data <- ACS.extract("B16005")
+data %<>% dplyr::rename(sv_penglish=percentage)
+```
+
+
+sv_pmultiunit
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B25024_007", "B25024_008", "B25024_009")
+totalvariable <- c("B25024_001")
+data <- ACS.extract("B25024")
+data %<>% dplyr::rename(sv_pmultiunit=percentage)
+```
+
+
+sv_pmobilehome
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B25024_010")
+totalvariable <- c("B25024_001")
+data <- ACS.extract("B25024")
+data %<>% dplyr::rename(sv_pmobilehome=percentage)
+```
+
+
+sv_pcrowding
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B25014_005", "B25014_006", "B25014_007")
+totalvariable <- c("B25014_001")
+data <- ACS.extract("B25014")
+data %<>% dplyr::rename(sv_pcrowding=percentage)
+```
+
+
+sv_pnovehicle
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B08201_002")
+totalvariable <- c("B08201_001")
+data <- ACS.extract("B08201")
+data %<>% dplyr::rename(sv_pnovehicle=percentage)
+```
+
+
+sv_groupquarterpop
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+test <- ACS_2018 %>%
+  dplyr::filter(variable == "B26001_001") %>%
+  dplyr::select(GEOID,estimate) %>%
+  dplyr::rename(sv_groupquarterpop = estimate)
+data %<>% dplyr::full_join(test, by="GEOID")
+```
+
+
+npi_keystone_
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+test <- readr::read_csv("https://raw.githubusercontent.com/Keystone-Strategy/covid19-intervention-data/master/complete_npis_inherited_policies.csv") %>%
+  dplyr::filter(fip_code > 0 & fip_code < 1000) %>%
+  dplyr::select(fip_code, npi, start_date) %>%
+  dplyr::mutate(npi=str_c("npi_keystone_",npi)) %>%
+  tidyr::spread(key=npi, value=start_date) %>%
+  dplyr::rename(state.fips.num = fip_code)
+data %<>% full_join(test, by="state.fips.num")
+```
+
+npi_UW_
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+test <- readr::read_csv("https://raw.githubusercontent.com/COVID19StatePolicy/SocialDistancing/master/data/USstatesCov19distancingpolicy.csv")
+# test <- readr::read_csv("https://raw.githubusercontent.com/cspark2610/SocialDistancing/master/data/USstatesCov19distancingpolicy.csv")
+```
+
+npi_CUSP
+```{r}
+df <- googlesheets4::read_sheet("https://docs.google.com/spreadsheets/d/1zu9qEWI8PsOI_i8nI_S29HDGHlIp2lfVMsGxpQ5tvAQ", col_types = "c")
+```
+?read_sheet
+
+hc_icubeds
+hc_icubeds_per1000
+hc_icubeds_per60more
+hc_hospitals
+hc_hospitals_per1000
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+test <- readr::read_csv(ggdrive.download.temp.file("1t-MG6kM5ZTQOPmZTpVQPnaJvXt6I-z8I")) %>%
+  dplyr::rename(GEOID = cnty_fips,
+                hc_hospitals = hospitals,
+                hc_icubeds = icu_beds) %>%
+  dplyr::select(GEOID, hc_hospitals, hc_icubeds)
+data %<>% dplyr::full_join(test, by = "GEOID") %>% 
+  dplyr::mutate(hc_hospitals_per1000 = hc_hospitals/demo_population*1000,
+                hc_icubeds_per1000 = hc_icubeds/demo_population*1000,
+                hc_icubeds_per60more1000 = hc_icubeds/demo_60more*1000,
+                hc_icubeds_per65more1000 = hc_icubeds/demo_65more*1000)
+```
+
+
+hc_pnotinsured_acs
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+sumvariable <- c("B27001_004", "B27001_007", "B27001_010", "B27001_013", "B27001_016", "B27001_019", "B27001_022", "B27001_025", "B27001_028",
+                 "B27001_032", "B27001_035", "B27001_038", "B27001_041", "B27001_044", "B27001_047", "B27001_050", "B27001_053", "B27001_056")
+totalvariable <- c("B27001_001")
+data <- ACS.extract("B27001")
+data %<>% dplyr::mutate(hc_pnotinsured_acs=100-percentage) %>% dplyr::select(-c(percentage))
+```
+
+
+hc_primarycare
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1F3RtLefhOeahbnwmuCWUzZ2101ugLZtw") %>% dplyr::rename(hc_primarycare = Value)
+```
+
+
+hc_primarycare_per1000
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data %<>% dplyr::mutate(hc_primarycare_per1000 = hc_primarycare / demo_population * 1000)
+```
+
+
+como_medicareheartdizprev
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1mLleUl6YqkwedBF7JFoQwEeJBAeoKi7X") %>% dplyr::rename(como_medicareheartdizprev = Value)
+```
+
+
+hc_medicaid
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1A5Y2HWk7ynRNNttNpsEKy13q_XY2ADpH") %>% dplyr::rename(hc_medicaid = Value)
+```
+
+
+como_pdiabetes - Diagnosed Diabetes data
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+test <- readr::read_csv(ggdrive.download.temp.file("1kmvAdF87LkPWNqwcUkBHAsxg5kghd6L1"), skip=2) %>%
+  dplyr::filter(!is.na(State)) %>%
+  dplyr::mutate(FIPS = as.numeric(CountyFIPS)) %>%
+  dplyr::mutate(como_pdiabetes = as.numeric(Percentage)) %>%
+  dplyr::select(FIPS, como_pdiabetes)
+data %<>% dplyr::full_join(test, by="FIPS") 
+```
+
+
+como_pobesity - Obesity data
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+test <- readr::read_csv(ggdrive.download.temp.file("1TaPqepJQl30vShuYgf-eeHEqXnLMj88Z"), skip=2) %>%
+  dplyr::filter(!is.na(State)) %>%
+  dplyr::mutate(FIPS = as.numeric(CountyFIPS)) %>%
+  dplyr::mutate(como_pobesity = as.numeric(Percentage)) %>%
+  dplyr::select(FIPS, como_pobesity)
+data %<>% dplyr::full_join(test, by="FIPS") 
+```
+
+
+como_htn_hosp
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1SwdQHDSNez1gGSriDVPVCjv2PhGuaR5l") %>% dplyr::rename(como_htn_hosp = Value)
+```
+
+
+como_htn_mort
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1huXZ8LSIQu0XFB_x-VoJgGVt3JrcV3T-") %>% dplyr::rename(como_htn_mort = Value)
+```
+
+
+como_cvd_hosp
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1Q5g58s_ErqpaTePfu8SqsiIUbJWx3dSq") %>% dplyr::rename(como_cvd_hosp = Value)
+```
+
+
+como_cvd_mort
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1X2drlwUOEpyrfwIVAwZ1lV3MeNfv_c6D") %>% dplyr::rename(como_cvd_mort = Value)
+```
+
+
+como_allheartdis_hosp
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1N7GRPHtUSjPpV9GLfjmPqLFttSYQIm94") %>% dplyr::rename(como_allheartdis_hosp = Value)
+```
+
+
+como-allheartdis_mort
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1nAMhVifbQKMKZUmK-AvnW8f_wJrqeBKw") %>% dplyr::rename(allheartdis_mort = Value)
+```
+
+
+como_stroke_hosp
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1_k67F1mJtowjE24dwj4PE8aPbjZ0gsYV") %>% dplyr::rename(como_stroke_hosp = Value)
+```
+
+
+como_stroke_mort
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.nccd("1om-sp4vsBRsf0VesQkTSnA38dPX_O63M") %>% dplyr::rename(como_stroke_mort = Value)
+```
+
+
+como_smoking
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.brfss("14ciNqceww0WnMoVm_HIZs6_UTV8vxeR5") %>% dplyr::rename(como_smoking= Data_Value)
+```
+
+
+como_COPD
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.brfss("1APlfrrVPWogiilNpPZkDTNOcRz0-Wjv9") %>% dplyr::rename(como_COPD= Data_Value)
+```
+
+
+como_asthma
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+data <- read.brfss("1FXC_Nr1aPo01NxvGjmAUpePjZwXnoJN5") %>% dplyr::rename(como_asthma= Data_Value)
+```
+
+
+como_cancer5yr
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+test <- readr::read_csv(ggdrive.download.temp.file("12ciyJMjWUirgUCwCwBPwPF_Le2vqtuVb"), skip = 8)
+test %<>% 
+  dplyr::filter(FIPS!=0) %>% # remove rows with no county values
+  dplyr::rename(como_cancer5yr = 4) %>% #rename col
+  dplyr::select(FIPS, como_cancer5yr) %>% # select cancer incidence rate variable and fips
+  dplyr::mutate(como_cancer5yr = as.character(como_cancer5yr),  # convert to str
+                como_cancer5yr = str_remove(como_cancer5yr, "#"),  # remove #
+                como_cancer5yr = as.numeric(como_cancer5yr)) %>% # convert to float 
+  na.omit() %>%
+  arrange(FIPS)
+data %<>% dplyr::full_join(test, by="FIPS") 
+```
+
+
+demo_bridgedrace_
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+url <- paste0("ftp://ftp.cdc.gov/pub/Health_Statistics/NCHS/nvss/bridged_race/pcen_v2018_y1018.sas7bdat.zip") # Paste FTP URL
+tempDir <- tempdir() # unzip to temp folder and temp file
+temp.file <- tempfile()
+download.file(url,temp.file,quiet=TRUE,mode="wb")
+
+df <- haven::read_sas(unzip(file.path(temp.file), exdir = tempDir)) %>%
+  rename_all(tolower)
+df %<>%
+  dplyr::filter(age != 0) %>%
+  dplyr::mutate(st_fips = as.character(st_fips),
+                co_fips = sprintf("%03d", co_fips),
+                fips = paste(st_fips, co_fips, sep=""))
+
+df2 <- df %>%
+  select(fips, pop2010_apr, pop2010_jul, pop2011, pop2012,pop2013,pop2014,pop2015,pop2016, pop2017, pop2018) %>% 
+  mutate(pop_avg = rowMeans(select(., starts_with('pop'))))
+popavg <- df2 %>% select(pop_avg)
+
+df2 <- df %>%
+  select(fips, pop2010_apr, pop2010_jul, pop2011, pop2012,pop2013,pop2014,pop2015,pop2016, pop2017, pop2018) %>% 
+  mutate(pop_avg = rowMeans(select(., starts_with('pop'))))
+popavg <- df2 %>% select(pop_avg)
+
+df3 <- df %>% select(fips, age, hisp, racesex)
+
+df_total <- cbind(df3, popavg)
+df_whites <- df_total %>% filter(racesex==1 | racesex == 2 & hisp==1)
+df_blacks <- df_total %>% filter(racesex==3 | racesex == 4 & hisp==1)
+df_ai <- df_total %>% filter(racesex==5 | racesex == 6 & hisp==1)
+df_api <- df_total %>% filter(racesex==7 | racesex == 8 & hisp==1)
+df_hisp <- df_total %>% filter(hisp==2)
+
+whites <- df_whites %>% group_by(fips) %>% summarize(whites =sum(pop_avg))
+blacks <- df_blacks %>% group_by(fips) %>% summarize(blacks =sum(pop_avg))
+american_indians_alaskan <- df_ai %>% group_by(fips) %>% summarise(american_indians_alaskan=sum(pop_avg))
+asians_pacific <- df_api %>% group_by(fips) %>% summarise(asians_pacific=sum(pop_avg))
+hisp <- df_hisp %>% group_by(fips) %>% summarise(hisp=sum(pop_avg))
+
+df_final <- whites %>% 
+  inner_join(blacks, by="fips") %>% 
+  inner_join(american_indians_alaskan, by ="fips") %>% 
+  inner_join(asians_pacific, by="fips") %>% 
+  inner_join(hisp, by="fips")
+
+df_final %<>% 
+  mutate(total=whites+blacks+american_indians_alaskan+asians_pacific+hisp) %>% 
+  mutate(p_whites=whites/total*100,
+         p_blacks=blacks/total*100,
+         p_american_indians_alaskan=american_indians_alaskan/total*100,
+         p_asians_pacific=asians_pacific/total*100,
+         p_hisp= hisp/total*100) %>%
+  select(-whites, -blacks, -american_indians_alaskan, -asians_pacific, -hisp) %>% 
+  dplyr::rename_all(function(x) paste0("demo_bridgedrace_", x)) %>%
+  dplyr::rename(GEOID = demo_bridgedrace_fips)
+
+
+data %<>% left_join(df_final, by = "GEOID")
+```
+
+
+hc_health_occupation_weighted
+```{r, message = FALSE, results = 'hide', warning = FALSE, include = FALSE}
+# this code is for an old dataset
+# df <- readr::read_csv(ggdrive.download.temp.file("1cQItc9_89QEOHjVnZvf_SGp-4gKxegun")) %>%
+#   rename_all(tolower)
+# 
+# df_final <- df %>% 
+#   dplyr::filter(county != 0) %>%
+#   dplyr::filter(year == 2015) %>%
+#   dplyr::select(county, wtfinl, occ2010) %>% 
+#   dplyr::filter((occ2010>= 3000)&(occ2010<=3540)) %>% 
+#   dplyr::group_by(county) %>% 
+#   stats::aggregate(wtfinl ~ county, ., sum) %>% 
+#   dplyr::mutate(wtfinl = wtfinl/12) %>%
+#   dplyr::rename(FIPS = county,
+#                 hc_health_occupation_weighted = wtfinl)
+# 
+# 
+# summary(df_final$hc_health_occupation_weighted)
+# 
+# data %<>% left_join(df_final, by = "FIPS")
+```
+
+```{r, message = FALSE, results = 'hide', warning = FALSE}
+df <- readr::read_csv(ggdrive.download.temp.file("1qy9Y7V8gYcM4qSKF0SFOCBhyPZ0wVMyb"))
+
+df2 <- df %>% 
+  select(STATE, STATEA, COUNTY, COUNTYA, 
+         FJOAW071, FJOAW072, 
+         FJOAW159, FJOAW160,    
+         FJOAW247, FJOAW248,
+         FJOAW335, FJOAW336,
+         FJOAW423, FJOAW424,
+         FJOAW599, FJOAW600,
+         FJOAW687, FJOAW688,
+         FJOAW775, FJOAW776,
+         FJOAW863, FJOAW864,
+         FJOAW951, FJOAW952,
+         FJOAWA39, FJOAWA40) %>% 
+  mutate(st_fips = as.character(STATEA),
+         co_fips = sprintf("%s", COUNTYA),
+         fips = paste(st_fips, co_fips, sep="")) %>% 
+  mutate(total = FJOAW071+FJOAW072+ 
+           FJOAW159+FJOAW160+ 
+           FJOAW247+FJOAW248+
+           FJOAW335+FJOAW336+
+           FJOAW423+FJOAW424+
+           FJOAW599+FJOAW600+
+           FJOAW687+FJOAW688+
+           FJOAW775+FJOAW776+
+           FJOAW863+FJOAW864+
+           FJOAW951+FJOAW952+
+           FJOAWA39+FJOAWA40) %>% 
+  group_by(fips) %>% 
+  summarise(healthcare_occ = sum(total))
+```
+
+County Health Ranking data
+https://www.countyhealthrankings.org/explore-health-rankings/rankings-data-documentation 
+
+
+```{r}
+# Code to read the SAS version dataset
+# url <- paste0("https://www.countyhealthrankings.org/sites/default/files/media/document/analytic_data2020.sas7bdat") #2020
+url <- paste0("https://www.countyhealthrankings.org/sites/default/files/media/document/analytic_data2019.sas7bdat") #2019
+tempDir <- tempdir() # unzip to temp folder and temp file
+temp.file <- tempfile()
+download.file(url,temp.file,quiet=TRUE,mode="wb")
+
+df <- haven::read_sas(temp.file) %>%
+  rename_all(tolower)
+
+
+```
+
+
+
+# 5. THE FINAL CLEAN DATASET
+
+Below is the preview of the firt 30 observations including all county indicators
+```{r}
+paged_table(data[1:30,], options = list(rows.print = 15))
+```
+
+```{r, include = FALSE}
+# saveRDS(data, file = "DATA/county_indicators.rds")
+```
+
+
